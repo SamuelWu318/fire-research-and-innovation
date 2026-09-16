@@ -136,6 +136,11 @@ if __name__ == '__main__':
     mode = 'ba'
     interval = 3
     ts_length = 6
+    # for all npz, take a single npz.
+    # the npz is two compressed npy files
+    # access data with ['data']
+    # access labels with ['labels']
+    
     image_path = os.path.join(root_path, 'dataset_train/'+mode+'_train_img_seqtoseq_alll_'+str(ts_length)+'i_'+str(interval)+'.npy')
     label_path = os.path.join(root_path, 'dataset_train/'+mode+'_train_label_seqtoseq_alll_'+str(ts_length)+'i_'+str(interval)+'.npy')
     transform = Normalize(mean = [18.76488,27.441864,20.584806,305.99478,294.31738,14.625097,276.4207,275.16766],

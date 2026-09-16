@@ -269,7 +269,7 @@ if __name__=='__main__':
         print("Top N best checkpoints:")
         for _, checkpoint in best_checkpoints:
             print(checkpoint)
-    if train or test_after_train:
+    if train:
         dfs=[]
         for year in ['2021']:
             filename = '~/CalFireMonitoring/roi/us_fire_' + year + '_out_new.csv'
