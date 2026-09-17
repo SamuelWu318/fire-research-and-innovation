@@ -1,3 +1,4 @@
+## For the original github: https://github.com/zhaoyutim/TS-SatFire
 # TS-SatFire Time-Series Multi-Task Satellite Imagery Dataset for Wildfire Detection and Prediction
 
 🔥This paper has been accepted in Nature Scientific Data! Link:[[https://www.nature.com/articles/s41597-025-06271-3]]
