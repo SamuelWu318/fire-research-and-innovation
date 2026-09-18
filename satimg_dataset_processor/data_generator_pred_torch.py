@@ -441,6 +441,14 @@ if __name__ == "__main__":
         pin_memory=False,
     )
 
-    batch = next(iter(train_dataloader))
-    print("data batch:", batch["data"].shape)
-    print("label batch:", batch["labels"].shape)
+    print(f"Total batches: {len(train_dataloader)}")
+
+    for batch_number, batch in enumerate(train_dataloader, start=1):
+        data_batch = batch["data"]
+        labels_batch = batch["labels"]
+
+        print(
+            f"Batch {batch_number}/{len(train_dataloader)} | "
+            f"data: {tuple(data_batch.shape)} | "
+            f"labels: {tuple(labels_batch.shape)}"
+        )

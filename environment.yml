@@ -1,11 +1,11 @@
 name: ts-satfire
 channels:
-  - anaconda
+  - conda-forge
   - pytorch
   - nvidia
   - defaults
 dependencies:
-  - _libgcc_mutex
+  - _libgcc_mutex=0.1=conda-forge
   - _openmp_mutex=4.5=2_kmp_llvm
   - affine=2.4.0=pyhd8ed1ab_0
   - aiohappyeyeballs=2.4.3=pyhd8ed1ab_0
