@@ -1,71 +1,44 @@
 import argparse
+
 import numpy as np
 
 
-def infer_layout(x):
-    if x.ndim != 5:
-        raise ValueError(f"Expected a 5D array, got shape {x.shape}")
-
-    if x.shape[1] >= 8 and x.shape[1] <= 200:
-        return 1, 2  # [N, C, T, H, W]
-    if x.shape[2] >= 8 and x.shape[2] <= 200:
-        return 2, 1  # [N, T, C, H, W]
-    raise ValueError(f"Could not infer channel/time layout from shape {x.shape}")
-
-
 def main():
-    parser = argparse.ArgumentParser(description="Validate TESSERA-augmented dataset concatenation.")
-    parser.add_argument("path", type=str, help="Path to the saved .npy dataset.")
+    parser = argparse.ArgumentParser(description="Validate a TESSERA-augmented dataset.")
+    parser.add_argument("path", help="Path to the augmented [N, C, T, H, W] .npy dataset.")
+    parser.add_argument(
+        "--original-path",
+        help="Optional unaugmented [N, 8, T, H, W] dataset to verify original channels are preserved.",
+    )
     args = parser.parse_args()
 
-    x = np.load(args.path)
+    x = np.load(args.path, mmap_mode="r")
     print(f"Dataset shape: {x.shape}")
+    if x.ndim != 5:
+        raise ValueError(f"Expected [N, C, T, H, W] 5D data, got {x.shape}.")
+    if x.shape[1] != 136:
+        raise ValueError(f"Expected 8 original + 128 TESSERA channels (136 total), got {x.shape[1]}.")
+    if x.shape[2] < 1 or min(x.shape[3:]) < 1:
+        raise ValueError(f"Dataset has an empty time or spatial dimension: {x.shape}.")
+    if not np.isfinite(x).all():
+        raise ValueError("Dataset contains NaN or infinite values.")
 
-    channel_axis, time_axis = infer_layout(x)
-    channels = x.shape[channel_axis]
-    print(f"Channel count: {channels}")
+    # Embeddings are static and are copied into every timestep at every pixel.
+    tessera = x[:, 8:, :, :, :]
+    if not np.allclose(tessera, tessera[:, :, :1, :, :]):
+        raise ValueError("TESSERA values differ across timesteps for at least one sample/channel/pixel.")
+    print("TESSERA block is finite and constant across timesteps.")
 
-    if channels < 8:
-        raise ValueError(f"Unexpected channel count {channels}; expected at least 8 original channels.")
+    if args.original_path:
+        original = np.load(args.original_path, mmap_mode="r")
+        expected_shape = (x.shape[0], 8, *x.shape[2:])
+        if original.shape != expected_shape:
+            raise ValueError(f"Original dataset shape {original.shape} does not match expected {expected_shape}.")
+        if not np.array_equal(x[:, :8, :, :, :], original, equal_nan=True):
+            raise ValueError("The first eight augmented channels do not match the original dataset.")
+        print("Original eight channels match the supplied unaugmented dataset.")
 
-    if channels >= 136:
-        print("TESSERA augmentation appears present: original channels + 128 appended.")
-    else:
-        print("No TESSERA augmentation detected at this point; channel count is still below 136.")
-
-    # Inspect the last 128 channels only, which should be a repeated broadcast vector across time.
-    tessera_start = channels - 128
-    if channels < 128:
-        print("Dataset has fewer than 128 channels; cannot inspect TESSERA block.")
-        return
-
-    if channel_axis == 1:
-        tessera = x[:, tessera_start:, :, :, :]
-        sample = tessera[0, :, :, 0, 0]
-        # sample shape: (128, T)
-        if sample.shape[1] > 1:
-            all_same = np.allclose(sample, sample[:, :1].repeat(sample.shape[1], axis=1))
-            print(f"Broadcast consistency across timesteps: {all_same}")
-            if not all_same:
-                print("Warning: TESSERA channels are not constant across time for this sample.")
-        else:
-            print("Only one timestep in sample; broadcast check is not meaningful.")
-    else:
-        tessera = x[:, :, tessera_start:, :, :]
-        sample = tessera[0, :, :, 0, 0]
-        # sample shape: (T, 128)
-        if sample.shape[0] > 1:
-            all_same = np.allclose(sample, sample[:1].repeat(sample.shape[0], axis=0))
-            print(f"Broadcast consistency across timesteps: {all_same}")
-            if not all_same:
-                print("Warning: TESSERA channels are not constant across time for this sample.")
-        else:
-            print("Only one timestep in sample; broadcast check is not meaningful.")
-
-    finite = np.isfinite(x).all()
-    print(f"All values finite: {finite}")
-    if not finite:
-        print("Warning: NaN or inf values were found in the dataset.")
+    print("Validation passed.")
 
 
 if __name__ == "__main__":

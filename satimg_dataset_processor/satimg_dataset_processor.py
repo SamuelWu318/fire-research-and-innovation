@@ -43,7 +43,7 @@ class AFBADatasetProcessor(SatProcessingUtils):
     def _read_tessera_geotiffs(self, geotiff_dir):
         geo_files = sorted(glob(os.path.join(geotiff_dir, '*.tif')) + glob(os.path.join(geotiff_dir, '*.tiff')))
         if not geo_files:
-            return np.zeros((128, 1, 1), dtype=np.float32)
+            return None
         arrays = []
         for geo_file in geo_files:
             with rasterio.open(geo_file, 'r') as reader:
@@ -68,7 +68,7 @@ class AFBADatasetProcessor(SatProcessingUtils):
             elif tessera_embedding.shape[0] == 1 and tessera_embedding.shape[1] == 128:
                 tessera_embedding = tessera_embedding.reshape(128, -1)
         if tessera_embedding.shape[0] != 128:
-            return np.zeros((128, coarse_shape[0], coarse_shape[1]), dtype=np.float32)
+            raise ValueError(f'Expected 128 TESSERA bands, got shape {tessera_embedding.shape}.')
 
         height, width = tessera_embedding.shape[1], tessera_embedding.shape[2]
         target_h, target_w = coarse_shape
@@ -93,23 +93,22 @@ class AFBADatasetProcessor(SatProcessingUtils):
         try:
             start_dt = pd.to_datetime(start_date)
         except Exception:
-            return None
+            raise ValueError(f'Invalid start_date for fire {fire_id}: {start_date!r}.')
 
         prior_year = int(start_dt.year) - 1
         if prior_year < 2017:
-            return None
+            raise ValueError(f'No supported prior-year TESSERA data for {fire_id} (year {prior_year}).')
 
         os.makedirs(cache_dir, exist_ok=True)
         cache_path = os.path.join(cache_dir, f'{fire_id}_{prior_year}.npz')
         if os.path.exists(cache_path):
-            cached = np.load(cache_path)
-            return cached['embedding']
+            with np.load(cache_path) as cached:
+                return cached['embedding']
 
         try:
             import geotessera as gt
         except ImportError:
-            print(f'geotessera is not installed; skipping TESSERA augmentation for {fire_id}.')
-            return None
+            raise RuntimeError(f'geotessera is required for TESSERA augmentation ({fire_id}).')
 
         bbox = self._build_centroid_bbox(float(lat), float(lon))
         export_dir = os.path.join(cache_dir, f'{fire_id}_{prior_year}')
@@ -130,8 +129,10 @@ class AFBADatasetProcessor(SatProcessingUtils):
             try:
                 embedding = np.asarray(tessera.fetch_embedding(float(lat), float(lon), prior_year), dtype=np.float32)
             except Exception:
-                print(f'Could not fetch TESSERA embedding for {fire_id} in year {prior_year}; skipping.')
-                return None
+                raise RuntimeError(f'Could not fetch TESSERA embedding for {fire_id} in year {prior_year}.')
+
+        if embedding is None:
+            raise RuntimeError(f'No TESSERA embedding found for {fire_id} in year {prior_year}.')
 
         if embedding.ndim == 1:
             embedding = embedding[:, np.newaxis, np.newaxis]
@@ -157,7 +158,9 @@ class AFBADatasetProcessor(SatProcessingUtils):
             fire_id = str(location)
             fire_meta = roi_lookup.get(fire_id)
             tessera_channels = None
-            if fire_meta is not None and use_tessera_embeddings:
+            if use_tessera_embeddings:
+                if fire_meta is None:
+                    raise KeyError(f'No ROI metadata (start_date/lat/lon) found for fire {fire_id}.')
                 tessera_channels = self._fetch_tessera_embedding_for_fire(
                     fire_id=fire_id,
                     lat=fire_meta['lat'],
@@ -165,6 +168,9 @@ class AFBADatasetProcessor(SatProcessingUtils):
                     start_date=fire_meta['start_date'],
                     cache_dir='tessera_cache',
                 )
+                if tessera_channels is None or tessera_channels.shape != (128, 256, 256):
+                    raise ValueError(f'Invalid TESSERA embedding for fire {fire_id}: '
+                                     f'{None if tessera_channels is None else tessera_channels.shape}.')
             study_area_path = data_path + '/' + location + '/' + satellite_day + '/'
             file_list = glob(study_area_path + '/*.tif')
             file_list.sort()
