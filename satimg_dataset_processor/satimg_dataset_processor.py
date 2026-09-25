@@ -3,20 +3,168 @@ from glob import glob
 
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
+import rasterio
 
 from satimg_dataset_processor.utils import SatProcessingUtils
 
 class AFBADatasetProcessor(SatProcessingUtils):
+    def _load_roi_lookup(self, roi_dir='roi'):
+        roi_lookup = {}
+        for csv_path in sorted(glob(os.path.join(roi_dir, '*.csv'))):
+            try:
+                df = pd.read_csv(csv_path)
+            except Exception:
+                continue
+            if 'Id' not in df.columns:
+                continue
+            cols = ['Id', 'start_date', 'lat', 'lon']
+            available = [c for c in cols if c in df.columns]
+            if not available:
+                continue
+            subset = df[available].dropna(subset=['Id', 'start_date', 'lat', 'lon'])
+            for _, row in subset.iterrows():
+                fire_id = str(int(float(row['Id']))) if pd.notna(row['Id']) else str(row['Id'])
+                roi_lookup[fire_id] = {
+                    'start_date': row['start_date'],
+                    'lat': float(row['lat']),
+                    'lon': float(row['lon']),
+                }
+        return roi_lookup
+
+    def _build_centroid_bbox(self, lat, lon, pad_deg=0.02):
+        return {
+            'min_lat': max(-90.0, lat - pad_deg),
+            'max_lat': min(90.0, lat + pad_deg),
+            'min_lon': max(-180.0, lon - pad_deg),
+            'max_lon': min(180.0, lon + pad_deg),
+        }
+
+    def _read_tessera_geotiffs(self, geotiff_dir):
+        geo_files = sorted(glob(os.path.join(geotiff_dir, '*.tif')) + glob(os.path.join(geotiff_dir, '*.tiff')))
+        if not geo_files:
+            return np.zeros((128, 1, 1), dtype=np.float32)
+        arrays = []
+        for geo_file in geo_files:
+            with rasterio.open(geo_file, 'r') as reader:
+                band_arr = reader.read()
+            if band_arr.ndim == 2:
+                band_arr = band_arr[np.newaxis, :, :]
+            arrays.append(band_arr.astype(np.float32))
+        stacked = np.concatenate(arrays, axis=0) if arrays else np.zeros((128, 1, 1), dtype=np.float32)
+        if stacked.shape[0] > 128:
+            stacked = stacked[:128]
+        if stacked.shape[0] < 128:
+            pad = np.zeros((128 - stacked.shape[0], *stacked.shape[1:]), dtype=np.float32)
+            stacked = np.concatenate((stacked, pad), axis=0)
+        return stacked
+
+    def _pool_tessera_to_coarse_grid(self, tessera_embedding, coarse_shape=(256, 256)):
+        if tessera_embedding.ndim == 1:
+            tessera_embedding = tessera_embedding[:, np.newaxis, np.newaxis]
+        if tessera_embedding.shape[0] != 128:
+            if tessera_embedding.shape[-1] == 128:
+                tessera_embedding = np.moveaxis(tessera_embedding, -1, 0)
+            elif tessera_embedding.shape[0] == 1 and tessera_embedding.shape[1] == 128:
+                tessera_embedding = tessera_embedding.reshape(128, -1)
+        if tessera_embedding.shape[0] != 128:
+            return np.zeros((128, coarse_shape[0], coarse_shape[1]), dtype=np.float32)
+
+        height, width = tessera_embedding.shape[1], tessera_embedding.shape[2]
+        target_h, target_w = coarse_shape
+        block_h = max(1, int(np.ceil(height / target_h)))
+        block_w = max(1, int(np.ceil(width / target_w)))
+        pooled = np.zeros((128, target_h, target_w), dtype=np.float32)
+        for i in range(target_h):
+            y0 = i * block_h
+            y1 = min(height, (i + 1) * block_h)
+            if y0 >= height:
+                continue
+            for j in range(target_w):
+                x0 = j * block_w
+                x1 = min(width, (j + 1) * block_w)
+                if x0 >= width:
+                    continue
+                window = tessera_embedding[:, y0:y1, x0:x1]
+                pooled[:, i, j] = np.nanmean(window.reshape(128, -1), axis=1)
+        return pooled
+
+    def _fetch_tessera_embedding_for_fire(self, fire_id, lat, lon, start_date, cache_dir='tessera_cache'):
+        try:
+            start_dt = pd.to_datetime(start_date)
+        except Exception:
+            return None
+
+        prior_year = int(start_dt.year) - 1
+        if prior_year < 2017:
+            return None
+
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_path = os.path.join(cache_dir, f'{fire_id}_{prior_year}.npz')
+        if os.path.exists(cache_path):
+            cached = np.load(cache_path)
+            return cached['embedding']
+
+        try:
+            import geotessera as gt
+        except ImportError:
+            print(f'geotessera is not installed; skipping TESSERA augmentation for {fire_id}.')
+            return None
+
+        bbox = self._build_centroid_bbox(float(lat), float(lon))
+        export_dir = os.path.join(cache_dir, f'{fire_id}_{prior_year}')
+        os.makedirs(export_dir, exist_ok=True)
+        try:
+            tessera = gt.GeoTessera()
+            tiles = gt.registry.load_blocks_for_region(
+                bounds=(bbox['min_lon'], bbox['min_lat'], bbox['max_lon'], bbox['max_lat']),
+                year=prior_year,
+            )
+            if tiles is not None:
+                tessera.export_embedding_geotiffs(tiles, export_dir, bands=None)
+                embedding = self._read_tessera_geotiffs(export_dir)
+            else:
+                raise ValueError('No TESSERA tiles found for the fire region.')
+        except Exception:
+            tessera = gt.GeoTessera()
+            try:
+                embedding = np.asarray(tessera.fetch_embedding(float(lat), float(lon), prior_year), dtype=np.float32)
+            except Exception:
+                print(f'Could not fetch TESSERA embedding for {fire_id} in year {prior_year}; skipping.')
+                return None
+
+        if embedding.ndim == 1:
+            embedding = embedding[:, np.newaxis, np.newaxis]
+        if embedding.shape[-1] == 128 and embedding.ndim == 3:
+            embedding = np.moveaxis(embedding, -1, 0)
+        pooled = self._pool_tessera_to_coarse_grid(embedding, coarse_shape=(256, 256))
+        np.savez_compressed(cache_path, embedding=pooled)
+        return pooled
+
     def dataset_generator_seqtoseq(self, mode, usecase, data_path, locations, file_name, label_name, save_path, rs_idx=0, cs_idx=0,
-                                               visualize=True, ts_length=10, interval=3, image_size=(224, 224)):
+                                               visualize=True, ts_length=10, interval=3, image_size=(224, 224), use_tessera_embeddings=False):
         satellite_day = 'VIIRS_Day'
         stack_over_location = []
         stack_label_over_locations = []
-        n_channels = 8
+        base_n_channels = 8
+        n_channels = base_n_channels
+        tessera_n_channels = 128 if use_tessera_embeddings else 0
+        roi_lookup = self._load_roi_lookup() if use_tessera_embeddings else {}
         if not os.path.exists(save_path):
             os.mkdir(save_path)
         for location in locations:
             print(location)
+            fire_id = str(location)
+            fire_meta = roi_lookup.get(fire_id)
+            tessera_channels = None
+            if fire_meta is not None and use_tessera_embeddings:
+                tessera_channels = self._fetch_tessera_embedding_for_fire(
+                    fire_id=fire_id,
+                    lat=fire_meta['lat'],
+                    lon=fire_meta['lon'],
+                    start_date=fire_meta['start_date'],
+                    cache_dir='tessera_cache',
+                )
             study_area_path = data_path + '/' + location + '/' + satellite_day + '/'
             file_list = glob(study_area_path + '/*.tif')
             file_list.sort()
@@ -45,7 +193,7 @@ class AFBADatasetProcessor(SatProcessingUtils):
                     i=file_list_size-ts_length
                     print('append the tail')
                     # break
-                output_array = np.zeros((ts_length, n_channels, output_shape_x, output_shape_y), dtype=np.float32)
+                output_array = np.zeros((ts_length, base_n_channels + tessera_n_channels, output_shape_x, output_shape_y), dtype=np.float32)
                 output_label = np.zeros((ts_length, 3, output_shape_x, output_shape_y), dtype=np.float32)
                 for j in range(ts_length):
                     file = file_list[j + i]
@@ -89,7 +237,9 @@ class AFBADatasetProcessor(SatProcessingUtils):
                     if j == interval-1:
                         new_base_acc_label = af_acc_label
                         new_base_ba_label = ba_label
-                    output_array[j, :n_channels, :, :] = img
+                    output_array[j, :base_n_channels, :, :] = img
+                    if use_tessera_embeddings and tessera_channels is not None:
+                        output_array[j, base_n_channels:, :, :] = tessera_channels
                     output_label[j, 0, :, :] = label
                     output_label[j, 1, :, :] = af_acc_label
                     output_label[j, 2, :, :] = af
@@ -126,7 +276,7 @@ class AFBADatasetProcessor(SatProcessingUtils):
         labels_stacked_over_locations = np.concatenate(stack_label_over_locations, axis=0).transpose((0,2,1,3,4))
         del stack_over_location
         del stack_label_over_locations
-        for i in range(8):
+        for i in range(dataset_stacked_over_locations.shape[1]):
             print(np.nanmean(dataset_stacked_over_locations[:,i,:,:,:]))
             print(np.nanstd(dataset_stacked_over_locations[:,i,:,:,:]))
         np.save(save_path + '/' + file_name, dataset_stacked_over_locations.astype(np.float32))
