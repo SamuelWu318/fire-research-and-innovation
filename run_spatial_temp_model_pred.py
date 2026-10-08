@@ -1,365 +1,847 @@
 import argparse
 import heapq
 import os
+from collections import defaultdict
+from pathlib import Path
+
+import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import torch
-SEED = 42
-np.random.seed(SEED)
-torch.manual_seed(SEED)
+import wandb
+from monai.data import decollate_batch
 from monai.losses.dice import DiceLoss
-from monai.metrics import MeanIoU, DiceMetric
-from monai.data import create_test_image_2d, decollate_batch, DataLoader
+from monai.metrics import DiceMetric, MeanIoU
 from monai.transforms import Activations, AsDiscrete, Compose
-from spatial_models.swinunetr.swinunetr import SwinUNETR
-from spatial_models.unetr.unetr import UNETR
-from spatial_models.unet import UNet
-from spatial_models.attentionunet import AttentionUnet
+from sklearn.metrics import f1_score, jaccard_score
 from torch import nn, optim
 from torch.cuda.amp import GradScaler
-from torch.utils.data import DataLoader
-from torchinfo import summary
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
-import wandb
+
 from satimg_dataset_processor.data_generator_pred_torch import FireDataset
-from sklearn.metrics import f1_score, jaccard_score
-import pandas as pd
-import matplotlib.pyplot as plt
-import pathlib
+from spatial_models.attentionunet import AttentionUnet
+from spatial_models.swinunetr.swinunetr import SwinUNETR
+from spatial_models.unet import UNet
+from spatial_models.unetr.unetr import UNETR
 
 
-def wandb_config(model_name, num_heads, hidden_size, batch_size, wandb_user_name):
+SEED = 42
+
+
+def configure_wandb(
+    model_name,
+    mode,
+    num_heads,
+    hidden_size,
+    batch_size,
+    learning_rate,
+    weight_decay,
+    max_epochs,
+    wandb_user_name,
+    run_test,
+):
+    """Initialize one W&B run for either training or testing."""
     wandb.login()
-    # wandb.init(project="tokenized_window_size" + str(window_size) + str(model_name) + 'run' + str(run), entity="zhaoyutim")
     wandb.init(project="AFBAPred", entity=wandb_user_name)
-    wandb.run.name = 'num_heads_' + str(num_heads) +'hidden_size_'+str(hidden_size)+'batchsize_'+str(batch_size)
-    wandb.config = {
-        "learning_rate": learning_rate,
-        "weight_decay": weight_decay,
-        "epochs": MAX_EPOCHS,
+    wandb.run.name = (
+        f"{'test' if run_test else 'train'}_{mode}_{model_name}_"
+        f"num_heads_{num_heads}_hidden_size_{hidden_size}_"
+        f"batchsize_{batch_size}"
+    )
+    wandb.config.update(
+        {
+            "learning_rate": learning_rate,
+            "weight_decay": weight_decay,
+            "epochs": max_epochs,
+            "batch_size": batch_size,
+            "mode": mode,
+            "model": model_name,
+        }
+    )
+
+
+def make_dataloader(dataset, batch_size, shuffle, num_workers, pin_memory):
+    """Create a conservative loader that can be tuned after RAM is measured."""
+    loader_options = {
+        "dataset": dataset,
         "batch_size": batch_size,
+        "shuffle": shuffle,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
     }
 
+    # Worker prefetching can hold multiple decompressed windows in RAM.
+    # Keep one prefetched batch per worker rather than PyTorch's default two.
+    if num_workers > 0:
+        loader_options["prefetch_factor"] = 1
+        loader_options["persistent_workers"] = True
 
-if __name__=='__main__':
+    return DataLoader(**loader_options)
 
-    import sys
 
-    parser = argparse.ArgumentParser(description='Process some integers.')
-    parser.add_argument('-m', type=str, help='Model to be executed')
-    parser.add_argument('-mode', type=str, help='BA or Pred')
-    parser.add_argument('-b', type=int, help='batch size')
-    parser.add_argument('-r', type=int, help='run')
-    parser.add_argument('-lr', type=float, help='learning rate')
+def validate_dataset_output(dataset, expected_model_channels, dataset_name):
+    """Fail before model construction if the Dataset/model shapes disagree."""
+    if len(dataset) == 0:
+        raise RuntimeError(f"{dataset_name} dataset contains no windows")
 
-    parser.add_argument('-nh', type=int, help='number-of-head')
-    parser.add_argument('-ed', type=int, help='embedding dimension')
-    parser.add_argument('-nc', type=int, help='n_channel')
-    parser.add_argument('-ts', type=int, help='ts_length')
-    parser.add_argument('-it', type=int, help='interval')
-    parser.add_argument('-test', dest='binary_flag', action='store_true', help='embedding dimension')
-    parser.add_argument('-seed', type=int, default=42)
+    sample = dataset[0]
+    data_shape = tuple(sample["data"].shape)
+    label_shape = tuple(sample["labels"].shape)
 
-    parser.set_defaults(binary_flag=False)
-    args = parser.parse_args()
+    if len(data_shape) != 4:
+        raise ValueError(
+            f"{dataset_name} sample must be (C,T,H,W), found {data_shape}"
+        )
+
+    actual_channels = data_shape[0]
+    if actual_channels != expected_model_channels:
+        raise ValueError(
+            f"{dataset_name} FireDataset produces {actual_channels} channels "
+            f"after preprocessing, but the model is configured for "
+            f"{expected_model_channels}. The current 27-channel archive plus "
+            "17-class land-cover expansion should produce 43 channels."
+        )
+
+    print(
+        f"{dataset_name} windows={len(dataset)}, "
+        f"data shape={data_shape}, label shape={label_shape}"
+    )
+
+
+def build_model(
+    model_name,
+    model_input_channels,
+    num_classes,
+    ts_length,
+    num_heads,
+    hidden_size,
+    unetr_version,
+):
+    """Build the requested spatial-temporal model."""
+    image_size = (ts_length, 256, 256)
+
+    if model_name == "unet3d":
+        return UNet(
+            spatial_dims=3,
+            in_channels=model_input_channels,
+            out_channels=num_classes,
+            channels=(64, 128, 256, 512, 1024),
+            strides=(1, 2, 2),
+        )
+
+    if model_name == "attunet":
+        return AttentionUnet(
+            spatial_dims=3,
+            in_channels=model_input_channels,
+            out_channels=num_classes,
+            channels=(64, 128, 256, 512, 1024),
+            strides=(1, 2, 2),
+        )
+
+    if model_name == "unetr3d":
+        patch_size = (1, 16, 16)
+        kernel_size_up_down = (1, 2, 2)
+
+        if unetr_version == "v0":
+            unetr_hidden_size = 768
+            mlp_dim = 3072
+        else:
+            unetr_hidden_size = 384
+            mlp_dim = 1536
+
+        return UNETR(
+            in_channels=model_input_channels,
+            out_channels=num_classes,
+            img_size=image_size,
+            spatial_dims=3,
+            norm_name="batch",
+            feature_size=16,
+            patch_size=patch_size,
+            kernel_size_up_down=kernel_size_up_down,
+            hidden_size=unetr_hidden_size,
+            mlp_dim=mlp_dim,
+        )
+
+    if model_name == "swinunetr3d":
+        return SwinUNETR(
+            image_size=image_size,
+            patch_size=(1, 2, 2),
+            window_size=(ts_length, 4, 4),
+            in_channels=model_input_channels,
+            out_channels=num_classes,
+            depths=(2, 2, 2, 2),
+            num_heads=(num_heads, num_heads, num_heads, num_heads),
+            feature_size=hidden_size,
+            norm_name="batch",
+            drop_rate=0.0,
+            attn_drop_rate=0.0,
+            drop_path_rate=0.0,
+            attn_version="v1",
+            normalize=True,
+            use_checkpoint=False,
+            spatial_dims=3,
+        )
+
+    raise NotImplementedError(f"Unsupported model: {model_name}")
+
+
+def forward_model(model, model_name, data_batch, device):
+    """Run the model and reduce its temporal output to one target day."""
+    if model_name == "utae":
+        data_batch = data_batch.transpose(1, 2).contiguous()
+        batch_positions = torch.zeros(data_batch.shape[:2], device=device)
+        return model(data_batch, batch_positions=batch_positions)
+
+    outputs = model(data_batch)
+    return outputs.mean(dim=2)
+
+
+def save_checkpoint(
+    model,
+    optimizer,
+    epoch,
+    val_loss,
+    save_path,
+):
+    torch.save(
+        {
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "loss": val_loss,
+        },
+        save_path,
+    )
+
+
+def train_model(
+    model,
+    model_name,
+    train_dataset,
+    train_dataloader,
+    val_dataset,
+    val_dataloader,
+    optimizer,
+    criterion,
+    scaler,
+    mean_iou,
+    dice_metric,
+    post_trans,
+    device,
+    max_epochs,
+    top_n_checkpoints,
+    checkpoint_name,
+):
+    """Train and validate while retaining the best validation checkpoints."""
+    # Store (-loss, path), making heap[0] the worst retained checkpoint.
+    best_checkpoints = []
+
+    for epoch in range(max_epochs):
+        model.train()
+        train_loss = 0.0
+        train_bar = tqdm(
+            train_dataloader,
+            total=len(train_dataloader),
+            desc=f"Train epoch {epoch + 1}/{max_epochs}",
+        )
+
+        for batch_idx, batch in enumerate(train_bar):
+            data_batch = batch["data"].to(device, non_blocking=True)
+            labels_batch = batch["labels"].float().to(
+                device,
+                non_blocking=True,
+            )
+
+            optimizer.zero_grad(set_to_none=True)
+            outputs = forward_model(
+                model,
+                model_name,
+                data_batch,
+                device,
+            )
+            loss = criterion(outputs, labels_batch)
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            train_loss += loss.detach().item() * data_batch.size(0)
+            running_loss = train_loss / (
+                (batch_idx + 1) * data_batch.size(0)
+            )
+            train_bar.set_postfix(loss=f"{running_loss:.4f}")
+
+            if not np.isfinite(train_loss):
+                raise RuntimeError(
+                    f"Training loss became non-finite at step {batch_idx}"
+                )
+
+        train_loss /= len(train_dataset)
+        wandb.log({"epoch": epoch, "train_loss": train_loss})
+        print(f"Epoch {epoch + 1}, Train Loss: {train_loss:.4f}")
+
+        model.eval()
+        val_loss = 0.0
+        iou_values = []
+        dice_values = []
+        val_bar = tqdm(
+            val_dataloader,
+            total=len(val_dataloader),
+            desc=f"Validation epoch {epoch + 1}/{max_epochs}",
+        )
+
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(val_bar):
+                data_batch = batch["data"].to(
+                    device,
+                    non_blocking=True,
+                )
+                labels_batch = batch["labels"].float().to(
+                    device,
+                    non_blocking=True,
+                )
+
+                outputs = forward_model(
+                    model,
+                    model_name,
+                    data_batch,
+                    device,
+                )
+                loss = criterion(outputs, labels_batch)
+                val_loss += loss.detach().item() * data_batch.size(0)
+
+                discrete_outputs = [
+                    post_trans(item)
+                    for item in decollate_batch(outputs)
+                ]
+                discrete_labels = decollate_batch(labels_batch)
+
+                iou_values.append(
+                    mean_iou(
+                        discrete_outputs,
+                        discrete_labels,
+                    ).mean().item()
+                )
+                dice_values.append(
+                    dice_metric(
+                        y_pred=discrete_outputs,
+                        y=discrete_labels,
+                    ).mean().item()
+                )
+
+                running_val_loss = val_loss / (
+                    (batch_idx + 1) * data_batch.size(0)
+                )
+                val_bar.set_postfix(loss=f"{running_val_loss:.4f}")
+
+        val_loss /= len(val_dataset)
+        mean_iou_val = float(np.mean(iou_values))
+        mean_dice_val = float(np.mean(dice_values))
+
+        wandb.log(
+            {
+                "val_loss": val_loss,
+                "miou": mean_iou_val,
+                "mdice": mean_dice_val,
+            }
+        )
+        print(
+            f"Epoch {epoch + 1}, Validation Loss: {val_loss:.4f}, "
+            f"Mean IoU: {mean_iou_val:.4f}, "
+            f"Mean Dice: {mean_dice_val:.4f}"
+        )
+
+        checkpoint_path = os.path.join(
+            wandb.run.dir,
+            checkpoint_name.format(epoch=epoch + 1),
+        )
+
+        if len(best_checkpoints) < top_n_checkpoints:
+            save_checkpoint(
+                model,
+                optimizer,
+                epoch,
+                val_loss,
+                checkpoint_path,
+            )
+            heapq.heappush(
+                best_checkpoints,
+                (-val_loss, checkpoint_path),
+            )
+        else:
+            worst_loss = -best_checkpoints[0][0]
+            if val_loss < worst_loss:
+                _, removed_path = heapq.heapreplace(
+                    best_checkpoints,
+                    (-val_loss, checkpoint_path),
+                )
+                if os.path.exists(removed_path):
+                    os.remove(removed_path)
+                save_checkpoint(
+                    model,
+                    optimizer,
+                    epoch,
+                    val_loss,
+                    checkpoint_path,
+                )
+
+    print("Best checkpoints:")
+    for negative_loss, checkpoint_path in sorted(
+        best_checkpoints,
+        reverse=True,
+    ):
+        print(f"loss={-negative_loss:.6f}: {checkpoint_path}")
+
+
+def normalize_for_plot(array):
+    minimum = float(array.min())
+    maximum = float(array.max())
+    if maximum == minimum:
+        return np.zeros_like(array, dtype=np.float32)
+    return (array - minimum) / (maximum - minimum)
+
+
+def load_test_ids(test_csv_path, available_ids):
+    """Use CSV order when available; otherwise test every available archive."""
+    test_csv_path = Path(test_csv_path).expanduser()
+    if not test_csv_path.exists():
+        print(
+            f"Test CSV not found at {test_csv_path}; using NPZ filenames"
+        )
+        return sorted(available_ids)
+
+    dataframe = pd.read_csv(test_csv_path, dtype={"Id": str})
+    ids = dataframe["Id"].astype(str)
+    ids = ids[ids != "US_2021_NV3700011641620210517"]
+    return [fire_id for fire_id in ids if fire_id in available_ids]
+
+
+def evaluate_model(
+    model,
+    model_name,
+    test_dataset,
+    batch_size,
+    num_workers,
+    pin_memory,
+    post_trans,
+    device,
+    test_csv_path,
+    plot_dir,
+    num_heads,
+    hidden_size,
+    model_input_channels,
+):
+    """Evaluate one fire at a time while sharing one indexed test Dataset."""
+    indices_by_fire = defaultdict(list)
+    for dataset_idx, (archive_path, _) in enumerate(test_dataset.index):
+        fire_id = archive_path.stem
+        if fire_id.startswith("p"):
+            fire_id = fire_id[1:]
+        indices_by_fire[fire_id].append(dataset_idx)
+
+    test_ids = load_test_ids(test_csv_path, set(indices_by_fire))
+    if not test_ids:
+        raise RuntimeError("No test fires match the available NPZ archives")
+
+    plot_dir = Path(plot_dir)
+    plot_dir.mkdir(parents=True, exist_ok=True)
+
+    model.eval()
+    f1_all = 0.0
+    iou_all = 0.0
+    evaluated_fire_count = 0
+
+    for fire_number, fire_id in enumerate(test_ids):
+        fire_subset = Subset(test_dataset, indices_by_fire[fire_id])
+        test_dataloader = make_dataloader(
+            fire_subset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+        )
+
+        fire_f1 = 0.0
+        fire_iou = 0.0
+        window_count = 0
+
+        for batch_number, batch in enumerate(test_dataloader):
+            data_batch = batch["data"]
+            labels_batch = batch["labels"]
+
+            with torch.no_grad():
+                outputs = forward_model(
+                    model,
+                    model_name,
+                    data_batch.to(device, non_blocking=True),
+                    device,
+                )
+                discrete_outputs = [
+                    post_trans(item)
+                    for item in decollate_batch(outputs)
+                ]
+
+            outputs_numpy = torch.stack(discrete_outputs).cpu().numpy()
+            window_count += data_batch.shape[0]
+
+            for sample_idx in range(data_batch.shape[0]):
+                prediction = outputs_numpy[sample_idx, 1]
+                label = (
+                    labels_batch[sample_idx, 1] > 0
+                ).cpu().numpy()
+
+                fire_f1 += f1_score(
+                    label.flatten(),
+                    prediction.flatten(),
+                    zero_division=1.0,
+                )
+                fire_iou += jaccard_score(
+                    label.flatten(),
+                    prediction.flatten(),
+                    zero_division=1.0,
+                )
+
+                background = data_batch[
+                    sample_idx,
+                    3,
+                    -1,
+                ].cpu().numpy()
+                plt.imshow(
+                    normalize_for_plot(background),
+                    cmap="gray",
+                )
+
+                true_positive = np.where(
+                    (prediction == 1) & (label == 1),
+                    1.0,
+                    np.nan,
+                )
+                false_positive = np.where(
+                    (prediction == 1) & (label == 0),
+                    1.0,
+                    np.nan,
+                )
+                false_negative = np.where(
+                    (prediction == 0) & (label == 1),
+                    1.0,
+                    np.nan,
+                )
+
+                plt.imshow(
+                    true_positive,
+                    cmap="autumn",
+                    interpolation="nearest",
+                )
+                plt.imshow(
+                    false_positive,
+                    cmap="summer",
+                    interpolation="nearest",
+                )
+                plt.imshow(
+                    false_negative,
+                    cmap="brg",
+                    interpolation="nearest",
+                )
+                plt.axis("off")
+
+                plot_name = (
+                    f"id_{fire_id}_nhead_{num_heads}_"
+                    f"hidden_{hidden_size}_batch_{batch_number}_"
+                    f"sample_{sample_idx}_fire_{fire_number}_"
+                    f"nc_{model_input_channels}.png"
+                )
+                plt.savefig(
+                    plot_dir / plot_name,
+                    bbox_inches="tight",
+                )
+                plt.close()
+
+        if window_count == 0:
+            print(f"Skipping {fire_id}: no windows")
+            continue
+
+        mean_fire_f1 = fire_f1 / window_count
+        mean_fire_iou = fire_iou / window_count
+        f1_all += mean_fire_f1
+        iou_all += mean_fire_iou
+        evaluated_fire_count += 1
+
+        print(f"ID {fire_id} IoU: {mean_fire_iou}")
+        print(f"ID {fire_id} F1: {mean_fire_f1}")
+
+    if evaluated_fire_count == 0:
+        raise RuntimeError("No test fires were evaluated")
+
+    model_f1 = f1_all / evaluated_fire_count
+    model_iou = iou_all / evaluated_fire_count
+    print(f"Model F1: {model_f1}; model IoU: {model_iou}")
+    wandb.log({"test_f1": model_f1, "test_iou": model_iou})
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Train or test spatial-temporal fire prediction models"
+    )
+    parser.add_argument("-m", required=True, help="Model name")
+    parser.add_argument("-mode", required=True, help="Task name, e.g. pred")
+    parser.add_argument("-b", type=int, required=True, help="Batch size")
+    parser.add_argument("-r", type=int, required=True, help="Run number")
+    parser.add_argument("-lr", type=float, required=True, help="Learning rate")
+    parser.add_argument("-nh", type=int, required=True, help="Number of heads")
+    parser.add_argument("-ed", type=int, required=True, help="Embedding size")
+    parser.add_argument(
+        "-nc",
+        type=int,
+        required=True,
+        help="Model input channels after preprocessing; currently 43",
+    )
+    parser.add_argument("-ts", type=int, required=True, help="Time-series length")
+    parser.add_argument(
+        "-it",
+        type=int,
+        required=True,
+        help="Generation interval; retained for experiment/checkpoint naming",
+    )
+    parser.add_argument(
+        "-test",
+        dest="run_test",
+        action="store_true",
+        help="Run test evaluation instead of training",
+    )
+    parser.add_argument("-seed", type=int, default=SEED)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument(
+        "--data-root",
+        default=None,
+        help="Directory containing train/, val/, and test/ NPZ folders",
+    )
+    parser.add_argument(
+        "--unetr-version",
+        choices=("v0", "v1"),
+        default="v1",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        default=None,
+        help="Checkpoint path for -test; overrides the generated path",
+    )
+    parser.add_argument("--load-epoch", type=int, default=199)
+    parser.add_argument(
+        "--test-csv",
+        default="~/CalFireMonitoring/roi/us_fire_2021_out_new.csv",
+    )
+    parser.add_argument("--plot-dir", default="evaluation_plot")
+    parser.add_argument("--wandb-user", default="gt-fri")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+
     model_name = args.m
-    batch_size = args.b
-
-    num_heads=args.nh
-    hidden_size=args.ed
-    ts_length=args.ts
-
-    run = args.r
-    lr = args.lr
-    MAX_EPOCHS = 100
-    learning_rate = lr
-    weight_decay = lr / 10
-    num_classes = 2
-    n_channel = args.nc
-    interval = args.it
     mode = args.mode
+    batch_size = args.b
+    num_heads = args.nh
+    hidden_size = args.ed
+    ts_length = args.ts
+    learning_rate = args.lr
+    weight_decay = learning_rate / 10
+    max_epochs = args.epochs
     top_n_checkpoints = 1
-    train = args.binary_flag
-    target_is_single_day = True
-        
-    root_dir = "/home/z/h/zhao2/TS-SatFire/"
-    wandb_user_name = "zhaoyutim"
-    root_path = f"{root_dir}/dataset/"
-   
-    
-    # Dataloader
-    if not train:
-        wandb_config(model_name, num_heads, hidden_size, batch_size, wandb_user_name=wandb_user_name)
-        image_path = os.path.join(root_path, 'dataset_train/'+mode+'_train_img_seqtoseq_alll_'+str(ts_length)+'i_'+str(interval)+'.npy')
-        label_path = os.path.join(root_path, 'dataset_train/'+mode+'_train_label_seqtoseq_alll_'+str(ts_length)+'i_'+str(interval)+'.npy')
-        val_image_path = os.path.join(root_path, 'dataset_val/'+mode+'_val_img_seqtoseq_alll_'+str(ts_length)+'i_'+str(interval)+'.npy')
-        val_label_path = os.path.join(root_path, 'dataset_val/'+mode+'_val_label_seqtoseq_alll_'+str(ts_length)+'i_'+str(interval)+'.npy')
-        train_dataset = FireDataset(image_path=image_path, label_path=label_path, ts_length=ts_length, n_channel=n_channel, target_is_single_day=target_is_single_day, use_augmentations=True)
-        train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-        val_dataset = FireDataset(image_path=val_image_path, label_path=val_label_path, ts_length=ts_length, n_channel=n_channel, target_is_single_day=target_is_single_day, use_augmentations=False)
-        val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    num_classes = 2
 
+    # The NPZ members contain 27 channels. FireDataset then replaces the
+    # land-cover channel with 17 one-hot channels, producing 43 model channels.
+    stored_n_channels = 27
+    model_input_channels = args.nc
+    if model_input_channels != 43:
+        raise ValueError(
+            f"-nc must be 43 with the current FireDataset preprocessing; "
+            f"received {model_input_channels}"
+        )
+
+    root_dir = Path("/content/data")
+    processed_data_root = (
+        Path(args.data_root).expanduser()
+        if args.data_root is not None
+        else root_dir
+    )
+    train_npz_dir = processed_data_root / "train"
+    val_npz_dir = processed_data_root / "val"
+    test_npz_dir = processed_data_root / "test"
+
+    configure_wandb(
+        model_name=model_name,
+        mode=mode,
+        num_heads=num_heads,
+        hidden_size=hidden_size,
+        batch_size=batch_size,
+        learning_rate=learning_rate,
+        weight_decay=weight_decay,
+        max_epochs=max_epochs,
+        wandb_user_name=args.wandb_user,
+        run_test=args.run_test,
+    )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    pin_memory = device.type == "cuda"
 
-    image_size = (ts_length, 256, 256)
-    window_size = (ts_length, 4, 4)
-    kernel_size_up_down = (1,2,2)
-    
-    if model_name == 'unet3d':
-        model = UNet(spatial_dims=3, in_channels=n_channel, out_channels=num_classes, channels=(64, 128, 256, 512, 1024), strides=(1, 2, 2))
-    elif model_name == 'attunet':
-        model = AttentionUnet(spatial_dims=3, in_channels=n_channel, out_channels=num_classes, channels=(64, 128, 256, 512, 1024), strides=(1,2,2))
-    elif model_name == 'unetr3d':
-        patch_size = (1, 16, 16)
-        if args.unetr_version == "v0":
-            model = UNETR(in_channels=n_channel, out_channels=num_classes, img_size=image_size, spatial_dims=3, norm_name='batch', 
-                        feature_size=16, patch_size=patch_size, kernel_size_up_down=kernel_size_up_down,  
-                        hidden_size=768, mlp_dim = 3072)
-        else:
-            model = UNETR(in_channels=n_channel, out_channels=num_classes, img_size=image_size, spatial_dims=3, norm_name='batch', 
-                        feature_size=16, patch_size=patch_size, kernel_size_up_down=kernel_size_up_down,  
-                        hidden_size=384, mlp_dim = 1536)
-    elif model_name == 'swinunetr3d':
-        patch_size = (1, 2, 2)
-        model = SwinUNETR(
-        image_size=image_size,
-        patch_size=patch_size,
-        window_size=window_size,
-        in_channels=n_channel,
-        out_channels=2,
-        depths=(2, 2, 2, 2),
-        num_heads=(num_heads, num_heads, num_heads, num_heads),
-        feature_size=hidden_size,
-        norm_name='batch',
-        drop_rate=0.0,
-        attn_drop_rate=0.0,
-        drop_path_rate=0.0,
-        attn_version='v1',
-        normalize=True,
-        use_checkpoint=False,
-        spatial_dims=3
+    model = build_model(
+        model_name=model_name,
+        model_input_channels=model_input_channels,
+        num_classes=num_classes,
+        ts_length=ts_length,
+        num_heads=num_heads,
+        hidden_size=hidden_size,
+        unetr_version=args.unetr_version,
     )
-    else:
-        raise 'not implemented'
-    
     model = nn.DataParallel(model)
     model.to(device)
-    
-    criterion = DiceLoss(include_background=True, reduction='mean', sigmoid=True)
-    mean_iou = MeanIoU(include_background=True, reduction="mean", ignore_empty=False)
-    dice_metric = DiceMetric(include_background=True, reduction="mean", ignore_empty=False)
-    post_trans = Compose([Activations(sigmoid=True), AsDiscrete(threshold=0.5)])
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    scaler = GradScaler()
-    model.to(device)
-    best_checkpoints = []
-    if not train:
-        # create a progress bar for the training loop
-        for epoch in range(MAX_EPOCHS):
-            model.train()
-            train_loss = 0.0
-            train_bar = tqdm(train_dataloader, total=len(train_dataloader))
-            for i, batch in enumerate(train_bar):
-                data_batch = batch['data']
-                labels_batch = batch['labels']
-                data_batch = data_batch.to(device)
-                labels_batch = labels_batch.to(torch.long).to(device)
 
-                optimizer.zero_grad()
-                #with torch.cuda.amp.autocast():
-                if model_name == "utae":
-                    data_batch = data_batch.transpose(1,2).contiguous()
-                    
-                    batch_positions = torch.zeros(data_batch.shape[:2], device=device)
-                    outputs = model(data_batch, batch_positions=batch_positions)
-                    
-                else:
-                    outputs = model(data_batch)
-                    outputs = outputs.mean(2) # time dimension
-                loss = criterion(outputs, labels_batch)
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
+    criterion = DiceLoss(
+        include_background=True,
+        reduction="mean",
+        sigmoid=True,
+    )
+    mean_iou = MeanIoU(
+        include_background=True,
+        reduction="mean",
+        ignore_empty=False,
+    )
+    dice_metric = DiceMetric(
+        include_background=True,
+        reduction="mean",
+        ignore_empty=False,
+    )
+    post_trans = Compose(
+        [Activations(sigmoid=True), AsDiscrete(threshold=0.5)]
+    )
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    scaler = GradScaler(enabled=device.type == "cuda")
 
-                train_loss += loss.detach().item() * data_batch.size(0)
-                train_bar.set_description(f"Epoch {epoch}/{MAX_EPOCHS}, Loss: {train_loss/((i+1)* data_batch.size(0)):.4f}")
-                if np.isnan(train_loss):
-                    print(f"Loss is NaN, ending training at step {i}.")
-                    exit(1)
+    if not args.run_test:
+        train_dataset = FireDataset(
+            npz_dir=train_npz_dir,
+            ts_length=ts_length,
+            n_channel=stored_n_channels,
+            target_is_single_day=True,
+            use_augmentations=True,
+        )
+        val_dataset = FireDataset(
+            npz_dir=val_npz_dir,
+            ts_length=ts_length,
+            n_channel=stored_n_channels,
+            target_is_single_day=True,
+            use_augmentations=False,
+        )
 
-            train_loss /= len(train_dataset)
-            wandb.log({'train_loss': train_loss})
+        # Use validation for the shape check so random augmentation is avoided.
+        validate_dataset_output(
+            val_dataset,
+            model_input_channels,
+            "validation",
+        )
 
-            print(f"Epoch {epoch + 1}, Train Loss: {train_loss:.4f}")
-            wandb.log({'epoch': epoch})
+        train_dataloader = make_dataloader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=pin_memory,
+        )
+        val_dataloader = make_dataloader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=pin_memory,
+        )
 
-            model.eval()
-            val_loss = 0.0
-            iou_values = []
-            dice_values = []
-            val_bar = tqdm(val_dataloader, total=len(val_dataloader))
-            for j, batch in enumerate(val_bar):
-                val_data_batch = batch['data']
-                val_labels_batch = batch['labels']
-                val_data_batch = val_data_batch.to(device)
-                val_labels_batch = val_labels_batch.to(torch.long).to(device)
+        checkpoint_name = (
+            f"model_{model_name}_mode_{mode}_num_heads_{num_heads}_"
+            f"hidden_size_{hidden_size}_batchsize_{batch_size}_"
+            "checkpoint_epoch_{epoch}_"
+            f"nc_{model_input_channels}_ts_{ts_length}.pth"
+        )
+        train_model(
+            model=model,
+            model_name=model_name,
+            train_dataset=train_dataset,
+            train_dataloader=train_dataloader,
+            val_dataset=val_dataset,
+            val_dataloader=val_dataloader,
+            optimizer=optimizer,
+            criterion=criterion,
+            scaler=scaler,
+            mean_iou=mean_iou,
+            dice_metric=dice_metric,
+            post_trans=post_trans,
+            device=device,
+            max_epochs=max_epochs,
+            top_n_checkpoints=top_n_checkpoints,
+            checkpoint_name=checkpoint_name,
+        )
+        return
 
-                with torch.no_grad():
-                    if model_name == "utae":
-                        val_data_batch = val_data_batch.transpose(1,2).contiguous()
-                        batch_positions = torch.zeros(val_data_batch.shape[:2], device=device)
-                        outputs = model(val_data_batch, batch_positions=batch_positions)
-                    else:
-                        outputs = model(val_data_batch)
-                        outputs = outputs.mean(2) # time dimension
-                loss = criterion(outputs, val_labels_batch)
+    test_dataset = FireDataset(
+        npz_dir=test_npz_dir,
+        ts_length=ts_length,
+        n_channel=stored_n_channels,
+        target_is_single_day=True,
+        use_augmentations=False,
+    )
+    validate_dataset_output(
+        test_dataset,
+        model_input_channels,
+        "test",
+    )
 
-                outputs = [post_trans(i) for i in decollate_batch(outputs)]
-                val_labels_batch = decollate_batch(val_labels_batch)
+    checkpoint_path = args.checkpoint
+    if checkpoint_path is None:
+        checkpoint_path = (
+            Path("saved_models")
+            / (
+                f"model_{model_name}_mode_{mode}_num_heads_{num_heads}_"
+                f"hidden_size_{hidden_size}_batchsize_{batch_size}_"
+                f"checkpoint_epoch_{args.load_epoch}_"
+                f"nc_{model_input_channels}_ts_{ts_length}.pth"
+            )
+        )
 
-                val_loss += loss.detach().item() * val_data_batch.size(0)
-                iou_values.append(mean_iou(outputs, val_labels_batch).mean().item())
-                dice_values.append(dice_metric(y_pred=outputs, y=val_labels_batch).mean().item())
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location=device,
+    )
+    model.load_state_dict(checkpoint["model_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    print(
+        f"Loaded checkpoint epoch={checkpoint['epoch']} "
+        f"loss={checkpoint['loss']}"
+    )
 
-                val_bar.set_description(
-                    f"Epoch {epoch}/{MAX_EPOCHS}, Loss: {val_loss / ((j + 1) * val_data_batch.size(0)):.4f}")
+    evaluate_model(
+        model=model,
+        model_name=model_name,
+        test_dataset=test_dataset,
+        batch_size=batch_size,
+        num_workers=args.num_workers,
+        pin_memory=pin_memory,
+        post_trans=post_trans,
+        device=device,
+        test_csv_path=args.test_csv,
+        plot_dir=args.plot_dir,
+        num_heads=num_heads,
+        hidden_size=hidden_size,
+        model_input_channels=model_input_channels,
+    )
 
-            val_loss /= len(val_dataset)
-            mean_iou_val = np.mean(iou_values)
-            mean_dice_val = np.mean(dice_values)
-            wandb.log({'val_loss': val_loss, 'miou': mean_iou_val, 'mdice': mean_dice_val})
-            print(f"Epoch {epoch + 1}, Validation Loss: {val_loss:.4f}, Mean IoU: {mean_iou_val:.4f}, Mean Dice: {mean_dice_val:.4f}")
 
-
-            # Save the top N model checkpoints based on validation loss
-            if (len(best_checkpoints) < top_n_checkpoints or val_loss < best_checkpoints[0][0]): # and epoch>=150:
-                #save_path = f"saved_models/model_{model_name}_mode_{mode}_num_heads_{num_heads}_hidden_size_{hidden_size}_batchsize_{batch_size}_checkpoint_epoch_{epoch + 1}_nc_{n_channel}_ts_{ts_length}.pth"
-                save_path = f"{wandb.run.dir}/model_{model_name}_mode_{mode}_num_heads_{num_heads}_hidden_size_{hidden_size}_batchsize_{batch_size}_checkpoint_epoch_{epoch + 1}_nc_{n_channel}_ts_{ts_length}.pth"
-
-                if len(best_checkpoints) == top_n_checkpoints:
-                    # Remove the checkpoint with the highest validation loss
-                    _, remove_checkpoint = heapq.heappop(best_checkpoints)
-                    if os.path.exists(remove_checkpoint):
-                        os.remove(remove_checkpoint)
-
-                # Save the new checkpoint
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'loss': loss,
-                }, save_path)
-
-                # Add the new checkpoint to the priority queue
-                heapq.heappush(best_checkpoints, (val_loss, save_path))
-
-                # Ensure that the priority queue has at most N elements
-                best_checkpoints = heapq.nlargest(top_n_checkpoints, best_checkpoints)
-        if os.path.exists(save_path):
-            os.remove(save_path)
-        torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'loss': loss,
-                }, save_path)
-        print("Top N best checkpoints:")
-        for _, checkpoint in best_checkpoints:
-            print(checkpoint)
-    if train:
-        dfs=[]
-        for year in ['2021']:
-            filename = '~/CalFireMonitoring/roi/us_fire_' + year + '_out_new.csv'
-            df = pd.read_csv(filename)
-            dfs.append(df)
-        df = pd.concat(dfs, ignore_index=True)
-        ids = df['Id']
-        ids = ids[~ids.isin(["US_2021_NV3700011641620210517"])]
-        ids = ids.values.astype(str)
-        
-        load_epoch = 199
-        load_path = f"saved_models/model_{model_name}_mode_{mode}_num_heads_{num_heads}_hidden_size_{hidden_size}_batchsize_{batch_size}_checkpoint_epoch_{load_epoch}_nc_{n_channel}_ts_{ts_length}.pth"
-
-        checkpoint = torch.load(load_path)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        loaded_epoch = checkpoint['epoch']
-        loaded_loss = checkpoint['loss']
-
-        # Make sure to set the model to eval or train mode after loading
-        model.eval()
-        
-        f1_all = 0
-        iou_all = 0
-
-        for i, id in enumerate(ids):
-
-            test_image_path = os.path.join(root_path,
-                                           f'dataset_test/{mode}_{id}_img_seqtoseql_{ts_length}i_1.npy')
-            test_label_path = os.path.join(root_path,
-                                           f'dataset_test/{mode}_{id}_label_seqtoseql_{ts_length}i_1.npy')
-            test_dataset = FireDataset(image_path=test_image_path, label_path=test_label_path, ts_length=ts_length, n_channel=n_channel, label_sel=0, target_is_single_day=True, use_augmentations=False)
-            test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-            
-            def normalization(array):
-                return (array-array.min()) / (array.max() - array.min())
-
-            output_stack = np.zeros((256, 256))
-            f1=0
-            iou=0
-            length=0
-            for j, batch in enumerate(test_dataloader):
-                test_data_batch = batch['data']
-                test_labels_batch = batch['labels']
-
-                with torch.no_grad():
-                    outputs = model(test_data_batch.to(device)).mean(2) # time dimension
-                outputs = [post_trans(i) for i in decollate_batch(outputs)]
-                outputs = np.stack(outputs, axis=0)
-                
-                length += test_data_batch.shape[0]
-                for k in range(test_data_batch.shape[0]):
-                    output_stack = outputs[k, 1, ...]
-                    label = test_labels_batch[k, 1, ...]>0
-                    label = label.numpy()
-
-                    f1_ts = f1_score(label.flatten(), output_stack.flatten(), zero_division=1.0)
-                    f1 += f1_ts
-                    iou_ts = jaccard_score(label.flatten(), output_stack.flatten(), zero_division=1.0)
-                    iou += iou_ts
-                    
-                    plt.imshow(normalization(test_data_batch[k, 3, -1, :]), cmap='gray')
-                    img_tp = np.where(np.logical_and(output_stack==1, label==1), 1.0, 0.)
-                    img_fp = np.where(np.logical_and(output_stack==1, label==0), 1.0, 0.)
-                    img_fn = np.where(np.logical_and(output_stack==0, label==1), 1.0, 0.)
-                    img_tp[img_tp==0.]=np.nan
-                    img_fp[img_fp==0.]=np.nan
-                    img_fn[img_fn==0.]=np.nan
-
-                    plt.imshow(img_tp, cmap='autumn', interpolation='nearest')
-                    plt.imshow(img_fp, cmap='summer', interpolation='nearest')
-                    plt.imshow(img_fn, cmap='brg', interpolation='nearest')
-                    plt.axis('off')
-
-                    dir_name = wandb.run.id
-                    if args.load_from_run_id:
-                        dir_name = args.load_from_run_id
-                    plot_dir = f'evaluation_plot'
-                    pathlib.Path(plot_dir).mkdir(parents=True, exist_ok=True)
-                    plot_path = 'id_{}_nhead_{}_hidden_{}_nbatch_{}_nts_{}_ts_{}_nc_{}.png'.format(id, num_heads, hidden_size, j, k, i, n_channel)
-                    image_path = os.path.join(plot_dir, plot_path)
-                    plt.savefig(image_path, bbox_inches='tight')
-                    plt.show()
-                    plt.close()
-                                        
-            iou_all += iou/length
-            f1_all += f1/length
-            print('ID{} IoU Score of the whole TS:{}'.format(id, iou/length))
-            print('ID{} F1 Score of the whole TS:{}'.format(id, f1/length))
-        print('model F1 Score: {} and iou score: {}'.format(f1_all/len(ids), iou_all/len(ids)))
-        
-        wandb.log({"test_f1": f1_all/len(ids), "test_iou": iou_all/len(ids)})
-
+if __name__ == "__main__":
+    main()
