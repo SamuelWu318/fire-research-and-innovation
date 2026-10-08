@@ -4,12 +4,22 @@ Ported from the SwinUNETR_data_grab Colab notebook. Repositories, tokens, and
 working directories are arguments rather than notebook globals, so a Colab
 notebook only has to read its secrets and call these functions.
 
+Hugging Face dataset repos:
+    SRC_REPO        ts-satfire                   raw GeoTIFFs + ROI CSVs
+    PROCESSED_REPO  ts-satfire-processed         old-format NPZ (data/labels) in data.zip
+    WINDOW_REPO     ts-satfire-processed-window  windowed NPZ per fire (training data)
+    TESSERA_REPO    ts-tesserafire               prior-year TESSERA per fire
+
 Typical flow:
-    process_data(...)            raw GeoTIFF repo -> windowed NPZ repo
-    download_processed_data(...) windowed NPZ repo -> <data>/{train,val,test}
-    upload_data_zip(...)         <data> -> data.zip in the NPZ repo
-    pull_zip_data_to(...)        data.zip -> <data>/{train,val,test}
-    convert_and_upload(...)      old-format NPZ -> windowed NPZ repo
+    process_data(...)            SRC_REPO -> WINDOW_REPO {train,val,test}/
+    tessera.process_tessera(...) SRC_REPO + TESSERA -> TESSERA_REPO tessera/
+    download_processed_data(...) WINDOW_REPO [+ TESSERA_REPO] -> <data>/{train,val,test}[,tessera]
+    upload_data_zip(...)         <data> -> data.zip in WINDOW_REPO
+    tessera.upload_tessera_zip() TESSERA_REPO tessera/ -> tessera.zip in TESSERA_REPO
+    pull_zip_data_to(...)        a repo's zip -> <data>
+    tessera.pull_tessera_data()  tessera.zip -> <data>/tessera, drops 2017 windows
+    pull_processed_data(...)     PROCESSED_REPO data.zip -> <data> (old format)
+    convert_and_upload(...)      old-format NPZ under <data> -> WINDOW_REPO
 """
 
 import gc
@@ -28,7 +38,10 @@ from satimg_dataset_processor.satimg_dataset_processor import PredDatasetProcess
 
 
 SRC_REPO = "SamuelWu318/ts-satfire"
-DEST_REPO = "SamuelWu318/ts-satfire-processed-window"
+PROCESSED_REPO = "SamuelWu318/ts-satfire-processed"
+WINDOW_REPO = "SamuelWu318/ts-satfire-processed-window"
+TESSERA_REPO = "SamuelWu318/ts-tesserafire"
+DEST_REPO = WINDOW_REPO  # earlier name for WINDOW_REPO, kept for existing notebooks
 
 VAL_IDS = [
     '20568194', '20701026', '20562846', '20700973', '24462610',
@@ -37,6 +50,36 @@ VAL_IDS = [
 ]
 TRAIN_VAL_YEARS = ('2017', '2018', '2019', '2020')
 TEST_YEARS = ('2021',)
+SPLITS = ("train", "val", "test")
+
+
+def list_fire_files(api, src_repo):
+    """Scan source repository and group GeoTIFFs by fire and mode."""
+    all_files = api.list_repo_files(
+        src_repo,
+        repo_type="dataset",
+    )
+    locations = {}
+
+    for file_name in all_files:
+        if not file_name.endswith(".tif"):
+            continue
+
+        parts = file_name.split("/")
+        if len(parts) < 3:
+            continue
+
+        location = parts[-3]
+        mode = parts[-2]
+        locations.setdefault(location, {}).setdefault(mode, []).append(
+            file_name
+        )
+
+    for location in locations:
+        for mode in locations[location]:
+            locations[location][mode].sort()
+
+    return locations
 
 
 # ----- DATA GRAB ----- #
@@ -66,31 +109,7 @@ class DatasetStreamer(PredDatasetProcessor):
 
     def get_repo_locations(self):
         """Scan source repository and group GeoTIFFs by fire and mode."""
-        all_files = self.api.list_repo_files(
-            self.src_repo,
-            repo_type="dataset",
-        )
-        locations = {}
-
-        for file_name in all_files:
-            if not file_name.endswith(".tif"):
-                continue
-
-            parts = file_name.split("/")
-            if len(parts) < 3:
-                continue
-
-            location = parts[-3]
-            mode = parts[-2]
-            locations.setdefault(location, {}).setdefault(mode, []).append(
-                file_name
-            )
-
-        for location in locations:
-            for mode in locations[location]:
-                locations[location][mode].sort()
-
-        return locations
+        return list_fire_files(self.api, self.src_repo)
 
     def run_split(
         self,
@@ -217,12 +236,8 @@ class DatasetStreamer(PredDatasetProcessor):
 
 # ----- SPLITTING ----- #
 
-def obtain_ids(src_repo=SRC_REPO, token=None, roi_dir="hf_roi"):
-    """Download the ROI CSVs from `src_repo` and split fire IDs.
-
-    Train/val come from 2017-2020 fires (val is the fixed VAL_IDS list);
-    test comes from 2021 fires.
-    """
+def download_roi_csvs(src_repo=SRC_REPO, token=None, roi_dir="hf_roi"):
+    """Download every ROI CSV (fire metadata) from `src_repo` into `roi_dir`."""
     os.makedirs(roi_dir, exist_ok=True)
 
     # obtains all roi files (metadata that maps onto fires)
@@ -243,6 +258,17 @@ def obtain_ids(src_repo=SRC_REPO, token=None, roi_dir="hf_roi"):
             token=token,
         )
         local_paths.append(local_path)
+
+    return local_paths
+
+
+def obtain_ids(src_repo=SRC_REPO, token=None, roi_dir="hf_roi"):
+    """Download the ROI CSVs from `src_repo` and split fire IDs.
+
+    Train/val come from 2017-2020 fires (val is the fixed VAL_IDS list);
+    test comes from 2021 fires.
+    """
+    local_paths = download_roi_csvs(src_repo, token, roi_dir)
 
     # --- training and validation dataframe ---
     dfs = []
@@ -282,7 +308,7 @@ def obtain_ids(src_repo=SRC_REPO, token=None, roi_dir="hf_roi"):
 def process_data(
     token,
     src_repo=SRC_REPO,
-    dest_repo=DEST_REPO,
+    window_repo=WINDOW_REPO,
     batch_size=10,
     length=10,
     interval=3,
@@ -292,14 +318,14 @@ def process_data(
     overwrite=False,
     debug=False,
 ):
-    """Stream raw fires from `src_repo` into windowed NPZs in `dest_repo`.
+    """Stream raw fires from `src_repo` into windowed NPZs in `window_repo`.
 
-    `token` needs write access to `dest_repo`. Fires already present in
-    `dest_repo` are skipped unless `overwrite` is set.
+    `token` needs write access to `window_repo`. Fires already present in
+    `window_repo` are skipped unless `overwrite` is set.
     """
     processor = DatasetStreamer(
         src_repo=src_repo,
-        dest_repo=dest_repo,
+        dest_repo=window_repo,
         token=token,
         batch_size=batch_size,
         work_dir=work_dir,
@@ -323,8 +349,9 @@ def process_data(
 # ----- DATA LOADING ----- #
 
 class DatasetLoader:
-    def __init__(self, processed_repo_id, token, train_ids, val_ids, test_ids, base_output_dir="./data"):
+    def __init__(self, processed_repo_id, token, train_ids, val_ids, test_ids, base_output_dir="./data", exclude_files=()):
         self.processed_repo_id = processed_repo_id
+        self.exclude_files = set(exclude_files)  # repo paths, e.g. 'train/p20778153.npz'
         self.token = token
         self.train_ids = set(train_ids)  # Convert to set for faster lookup
         self.val_ids = set(val_ids)      # Convert to set for faster lookup
@@ -345,6 +372,15 @@ class DatasetLoader:
         all_processed_files = self.api.list_repo_files(self.processed_repo_id, repo_type="dataset")
 
         for file_path in all_processed_files:
+            # Only split folders hold window archives; tessera/p<id>.npz shares
+            # their file names and must not be routed into a split folder.
+            if file_path.split('/')[0] not in SPLITS:
+                continue
+            if file_path in self.exclude_files:
+                print(f"Skipping {file_path}: excluded")
+                if os.path.exists(os.path.join(self.base_output_dir, file_path)):
+                    print(f"WARNING: {file_path} is excluded but already exists in {self.base_output_dir}")
+                continue
             if file_path.endswith('.npz'):
                 # Extract loc_name from filename, e.g., 'train/p20562846.npz' -> '20562846'
                 filename_without_extension = os.path.basename(file_path).replace('.npz', '').replace('p', '')
@@ -373,25 +409,73 @@ class DatasetLoader:
 
         print("Data loading and organization complete.")
 
+    def load_tessera(self, tessera_repo=TESSERA_REPO):
+        """Download tessera/* (per-fire embeddings) from `tessera_repo` into <base_output_dir>/tessera."""
+        tessera_files = [
+            file_path
+            for file_path in self.api.list_repo_files(tessera_repo, repo_type="dataset")
+            if file_path.startswith("tessera/")
+        ]
+        print(f"Downloading {len(tessera_files)} TESSERA files")
+        for file_path in tessera_files:
+            if os.path.exists(os.path.join(self.base_output_dir, file_path)):
+                continue
+            hf_hub_download(
+                repo_id=tessera_repo,
+                filename=file_path,
+                repo_type="dataset",
+                local_dir=self.base_output_dir,
+                token=self.token,
+            )
+
+        missing = [
+            os.path.join(split, file_name)
+            for split in SPLITS
+            for file_name in sorted(os.listdir(os.path.join(self.base_output_dir, split)))
+            if file_name.endswith(".npz")
+            and not os.path.exists(os.path.join(self.base_output_dir, "tessera", file_name))
+        ]
+        if missing:
+            print(f"WARNING: {len(missing)} window archives have no TESSERA file: {missing}")
+
 
 def download_processed_data(
     token,
-    dest_repo=DEST_REPO,
+    window_repo=WINDOW_REPO,
     src_repo=SRC_REPO,
     base_output_dir="./data",
     roi_dir="hf_roi",
+    include_tessera=False,
+    tessera_repo=TESSERA_REPO,
 ):
-    """Download every processed NPZ into <base_output_dir>/{train,val,test}."""
+    """Download every windowed NPZ in `window_repo` into <base_output_dir>/{train,val,test}.
+
+    With `include_tessera` (TESSERA mode), fires with no prior-year TESSERA
+    (the 2017 fires) are left out and per-fire embeddings are downloaded from
+    `tessera_repo` into <base_output_dir>/tessera. The dropped archive names are kept on the
+    returned loader as `excluded_npz`. Use a different `base_output_dir` for
+    each mode so a full download never mixes with a TESSERA one.
+    """
     train_ids, val_ids, test_ids = obtain_ids(src_repo, token, roi_dir)
+    excluded_npz = []
+    if include_tessera:
+        from satimg_dataset_processor.tessera import tessera_excluded_npz
+
+        excluded_npz = tessera_excluded_npz(token, src_repo, roi_dir)
+        print(f"TESSERA mode: dropping {len(excluded_npz)} fires without prior-year TESSERA")
     data_loader = DatasetLoader(
-        processed_repo_id=dest_repo,
+        processed_repo_id=window_repo,
         token=token,
         train_ids=train_ids,
         val_ids=val_ids,
         test_ids=test_ids,
         base_output_dir=base_output_dir,
+        exclude_files=excluded_npz,
     )
+    data_loader.excluded_npz = excluded_npz
     data_loader.load_and_organize_data()
+    if include_tessera:
+        data_loader.load_tessera(tessera_repo)
     return data_loader
 
 
@@ -419,10 +503,10 @@ def zip_data_from(folders, output_path):
 
 
 # send data.zip to repo
-def zip_data_to(token, zip_path="./data.zip", dest_repo=DEST_REPO):
+def zip_data_to(token, zip_path="./data.zip", repo_id=WINDOW_REPO, zip_name="data.zip"):
     return HfApi().upload_file(
-        repo_id=dest_repo,
-        path_in_repo="data.zip",
+        repo_id=repo_id,
+        path_in_repo=zip_name,
         path_or_fileobj=str(zip_path),
         repo_type="dataset",
         token=token,
@@ -433,19 +517,24 @@ def upload_data_zip(
     token,
     data_root="./data",
     zip_path="./data.zip",
-    dest_repo=DEST_REPO,
-    folders=("test", "train", "val", "esri"),
+    repo_id=WINDOW_REPO,
+    folders=("test", "train", "val", "esri", "tessera"),
+    zip_name="data.zip",
 ):
-    """Zip <data_root>/<folder> for each folder and upload it as data.zip."""
+    """Zip <data_root>/<folder> for each folder and upload it to `repo_id` as `zip_name`.
+
+    TESSERA mode uses repo_id=TESSERA_REPO, zip_name="data_tessera.zip", so
+    the full data.zip in WINDOW_REPO is never replaced by the reduced set.
+    """
     zip_data_from([os.path.join(data_root, folder) for folder in folders], zip_path)
-    return zip_data_to(token, zip_path, dest_repo)
+    return zip_data_to(token, zip_path, repo_id, zip_name)
 
 
 # pull from processed data the zip file.
-def pull_zip_data_to(extraction_path, token=None, dest_repo=DEST_REPO, download_dir="./data"):
+def pull_zip_data_to(extraction_path, token=None, repo_id=WINDOW_REPO, download_dir="./data", zip_name="data.zip"):
     zip_file_path = HfApi().hf_hub_download(
-        repo_id=dest_repo,
-        filename="data.zip",
+        repo_id=repo_id,
+        filename=zip_name,
         repo_type="dataset",
         local_dir=download_dir,
         token=token,
@@ -457,6 +546,15 @@ def pull_zip_data_to(extraction_path, token=None, dest_repo=DEST_REPO, download_
         print(f'Successfully extracted {zip_file_path} to {extraction_path}')
     else:
         print(f'Error: {zip_file_path} not found. Please ensure the data is downloaded first.')
+
+
+def pull_processed_data(data_root, token=None, processed_repo=PROCESSED_REPO):
+    """Pull the old-format data.zip from `processed_repo` into `data_root`.
+
+    This is the input to convert_and_upload. Use a different `data_root` than
+    the windowed data, since both formats use the same file names.
+    """
+    pull_zip_data_to(data_root, token=token, repo_id=processed_repo, download_dir=data_root)
 
 
 # ----- OLD NPZ CONVERSION ----- #
@@ -497,7 +595,7 @@ def convert_old_npz(source_path, destination_path):
         )
 
 
-def upload_batch(api, staging_dir, split_name, count, dest_repo=DEST_REPO):
+def upload_batch(api, staging_dir, split_name, count, window_repo=WINDOW_REPO):
     """Upload one staged batch and remove it after success."""
     if count == 0:
         return
@@ -506,7 +604,7 @@ def upload_batch(api, staging_dir, split_name, count, dest_repo=DEST_REPO):
 
     api.upload_folder(
         folder_path=str(staging_dir),
-        repo_id=dest_repo,
+        repo_id=window_repo,
         repo_type="dataset",
         path_in_repo=split_name,
     )
@@ -521,12 +619,12 @@ def upload_batch(api, staging_dir, split_name, count, dest_repo=DEST_REPO):
 def convert_and_upload(
     token,
     data_root="./data",
-    dest_repo=DEST_REPO,
+    window_repo=WINDOW_REPO,
     batch_size=10,
     overwrite_existing=False,
     work_dir=".",
 ):
-    """Convert old-format NPZs under <data_root>/{train,val,test} and upload."""
+    """Convert old-format NPZs under <data_root>/{train,val,test} and upload to `window_repo`."""
     if not token:
         raise RuntimeError("A Hugging Face write token is required")
 
@@ -536,14 +634,14 @@ def convert_and_upload(
     api = HfApi(token=token)
 
     api.create_repo(
-        repo_id=dest_repo,
+        repo_id=window_repo,
         repo_type="dataset",
         exist_ok=True,
     )
 
     existing_remote_files = set(
         api.list_repo_files(
-            repo_id=dest_repo,
+            repo_id=window_repo,
             repo_type="dataset",
         )
     )
@@ -623,7 +721,7 @@ def convert_and_upload(
                         split_staging_dir,
                         split_name,
                         staged_count,
-                        dest_repo,
+                        window_repo,
                     )
                     staged_count = 0
 
@@ -634,7 +732,7 @@ def convert_and_upload(
                     split_staging_dir,
                     split_name,
                     staged_count,
-                    dest_repo,
+                    window_repo,
                 )
 
         completed_successfully = True
@@ -644,7 +742,7 @@ def convert_and_upload(
         print(f"Archives converted: {total_converted}")
         print(f"Archives skipped:   {total_skipped}")
         print(f"Windows converted:  {total_windows}")
-        print(f"Destination:         {dest_repo}")
+        print(f"Destination:         {window_repo}")
 
     finally:
         if completed_successfully:
