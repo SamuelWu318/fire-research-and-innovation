@@ -481,6 +481,7 @@ dependencies:
       - colorlog==4.8.0
       - flask-jwt-extended==4.7.1
       - grpcio==1.68.0
+      - huggingface_hub>=0.30
       - importlib-metadata==8.5.0
       - opentelemetry-exporter-otlp==1.28.2
       - opentelemetry-exporter-otlp-proto-common==1.28.2

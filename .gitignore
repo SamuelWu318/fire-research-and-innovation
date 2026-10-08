@@ -1,2 +1,9 @@
 __pycache__/
 *.pyc
+# Hugging Face dataset pipeline outputs
+hf_roi/
+temp/
+staging/
+data/
+data.zip
+windowed_npz_*/

@@ -1,57 +1,134 @@
-import pandas as pd
+"""Build the TS-SatFire next-day prediction dataset through Hugging Face.
+
+Each subcommand wraps one function in satimg_dataset_processor.hf_dataset.
+The token defaults to the HF_TOKEN environment variable.
+
+    python dataset_gen_pred.py process -ts 10 -it 3
+    python dataset_gen_pred.py download --data-root ./data
+    python dataset_gen_pred.py upload-zip --data-root ./data
+    python dataset_gen_pred.py pull-zip --data-root ./data
+    python dataset_gen_pred.py convert --data-root ./data
+"""
+
 import argparse
 import os
-from satimg_dataset_processor.satimg_dataset_processor import PredDatasetProcessor
-dfs = []
-for year in ['2017', '2018', '2019', '2020']:
-    filename = 'roi/us_fire_' + year + '_out_new.csv'
-    df = pd.read_csv(filename)
-    dfs.append(df)
-df = pd.concat(dfs, ignore_index=True)
-dfs_test = []
-for year in ['2021']:
-    filename = 'roi/us_fire_' + year + '_out_new.csv'
-    df_test = pd.read_csv(filename)
-    dfs_test.append(df_test)
-df_test = pd.concat(dfs_test, ignore_index=True)
-val_ids = ['20568194', '20701026','20562846','20700973','24462610', '24462788', '24462753', '24103571', '21998313', '21751303', '22141596', '21999381', '23301962', '22712904', '22713339']
 
-df = df.sort_values(by=['Id'])
-df['Id'] = df['Id'].astype(str)
-train_df = df[~df.Id.isin(val_ids)]
-val_df = df[df.Id.isin(val_ids)]
+from satimg_dataset_processor.hf_dataset import (
+    DEST_REPO,
+    SRC_REPO,
+    convert_and_upload,
+    download_processed_data,
+    process_data,
+    pull_zip_data_to,
+    upload_data_zip,
+)
 
-train_ids = train_df['Id'].values.astype(str)
-val_ids = val_df['Id'].values.astype(str)
 
-df_test = df_test.sort_values(by=['Id'])
-test_ids = df_test['Id'].values.astype(str)
-test_label_sel = df_test['label_sel'].values.astype(int)
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument(
+        "--token",
+        default=os.environ.get("HF_TOKEN"),
+        help="Hugging Face token (default: $HF_TOKEN)",
+    )
+    parser.add_argument("--src-repo", default=SRC_REPO)
+    parser.add_argument("--dest-repo", default=DEST_REPO)
+    parser.add_argument("--roi-dir", default="hf_roi")
+    parser.add_argument("--work-dir", default=".")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    process = subparsers.add_parser(
+        "process",
+        help="Stream raw fires into windowed NPZs in --dest-repo",
+    )
+    process.add_argument("-ts", type=int, default=10, help="Length of TS")
+    process.add_argument("-it", type=int, default=3, help="Interval")
+    process.add_argument(
+        "-mode",
+        nargs="+",
+        choices=("train", "val", "test"),
+        default=["train", "val", "test"],
+    )
+    process.add_argument("--batch-size", type=int, default=10)
+    process.add_argument("--overwrite", action="store_true")
+    process.add_argument("--debug", action="store_true")
+
+    download = subparsers.add_parser(
+        "download",
+        help="Download processed NPZs into --data-root/{train,val,test}",
+    )
+    download.add_argument("--data-root", default="./data")
+
+    upload_zip = subparsers.add_parser(
+        "upload-zip",
+        help="Zip --data-root and upload it as data.zip",
+    )
+    upload_zip.add_argument("--data-root", default="./data")
+    upload_zip.add_argument("--zip-path", default="./data.zip")
+
+    pull_zip = subparsers.add_parser(
+        "pull-zip",
+        help="Download data.zip and extract it into --data-root",
+    )
+    pull_zip.add_argument("--data-root", default="./data")
+
+    convert = subparsers.add_parser(
+        "convert",
+        help="Convert old-format NPZs under --data-root and upload them",
+    )
+    convert.add_argument("--data-root", default="./data")
+    convert.add_argument("--batch-size", type=int, default=10)
+    convert.add_argument("--overwrite", action="store_true")
+
+    return parser.parse_args()
+
+
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Process some integers.')
-    parser.add_argument('-mode', type=str, help='Train/Val/Test')
-    parser.add_argument('-ts', type=int, help='Length of TS')
-    parser.add_argument('-it', type=int, help='Interval')
-    args = parser.parse_args()
-    ts_length = args.ts
-    interval = args.it
-    modes = args.mode
-    if modes == 'train':
-        locations = train_ids
-    elif modes == 'val':
-        locations = val_ids
-    else:
-        locations = test_ids
-    usecase='pred'
-    satimg_processor = PredDatasetProcessor()
-    if modes in ['train', 'val']:
-        satimg_processor.pred_dataset_generator_seqtoseq(mode=modes, locations=locations, visualize=False, data_path='/home/z/h/zhao2/CalFireMonitoring/data/',
-                                                file_name=usecase+'_'+modes+'_img_seqtoseq_alll_'+str(ts_length)+'i_'+str(interval)+'.npy',
-                                                label_name=usecase+'_'+modes+'_label_seqtoseq_alll_'+str(ts_length)+'i_'+str(interval)+'.npy',
-                                                save_path = 'dataset/dataset_'+modes, ts_length=ts_length, 
-                                                interval=interval, image_size=(256, 256))
-    else:
-        for i, id in enumerate(locations):
-            print(id)
-            satimg_processor.pred_dataset_generator_seqtoseq(mode = 'test', locations=[id], visualize=False, data_path='/home/z/h/zhao2/CalFireMonitoring/data/',file_name=usecase+'_'+id+'_img_seqtoseql_'+str(ts_length)+'i_'+str(interval)+'.npy', label_name=usecase+'_'+id+'_label_seqtoseql_'+str(ts_length)+'i_'+str(interval)+'.npy',
-                                                           save_path='dataset/dataset_test', ts_length=ts_length, interval=interval, rs_idx=0.3, cs_idx=0.3, image_size=(256, 256), label_sel=test_label_sel[i])
+    args = parse_args()
+
+    if args.command == "process":
+        process_data(
+            args.token,
+            src_repo=args.src_repo,
+            dest_repo=args.dest_repo,
+            batch_size=args.batch_size,
+            length=args.ts,
+            interval=args.it,
+            splits=args.mode,
+            roi_dir=args.roi_dir,
+            work_dir=args.work_dir,
+            overwrite=args.overwrite,
+            debug=args.debug,
+        )
+    elif args.command == "download":
+        download_processed_data(
+            args.token,
+            dest_repo=args.dest_repo,
+            src_repo=args.src_repo,
+            base_output_dir=args.data_root,
+            roi_dir=args.roi_dir,
+        )
+    elif args.command == "upload-zip":
+        upload_data_zip(
+            args.token,
+            data_root=args.data_root,
+            zip_path=args.zip_path,
+            dest_repo=args.dest_repo,
+        )
+    elif args.command == "pull-zip":
+        # data.zip stores train/, val/, test/ at its root.
+        pull_zip_data_to(
+            args.data_root,
+            token=args.token,
+            dest_repo=args.dest_repo,
+            download_dir=args.data_root,
+        )
+    elif args.command == "convert":
+        convert_and_upload(
+            args.token,
+            data_root=args.data_root,
+            dest_repo=args.dest_repo,
+            batch_size=args.batch_size,
+            overwrite_existing=args.overwrite,
+            work_dir=args.work_dir,
+        )
