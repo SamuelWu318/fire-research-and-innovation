@@ -299,7 +299,7 @@ class PredDatasetProcessor(SatProcessingUtils):
         return np.isfinite(array) & (array > 0)
 
     @staticmethod
-    def _save_windowed_npz(save_path, data, labels):
+    def _save_windowed_npz(save_path, data, labels, label_sel=None):
         """Save each temporal window as its own compressed NPZ member.
 
         Unlike saving `data` as one five-dimensional member, this layout lets
@@ -318,6 +318,9 @@ class PredDatasetProcessor(SatProcessingUtils):
             "format_version": np.asarray(2, dtype=np.int16),
             "num_windows": np.asarray(number_of_windows, dtype=np.int32),
         }
+        if label_sel is not None:
+            # Records which label rule built the targets; readers ignore it.
+            payload["label_sel"] = np.asarray(label_sel, dtype=np.int16)
 
         for window_idx in range(number_of_windows):
             suffix = f"{window_idx:03d}"

@@ -42,6 +42,20 @@ WINDOW_REPO = window_repo_for()
 # new windows are added so one repo never mixes window settings.
 WINDOW_CONFIG_FILE = "window_config.json"
 
+# ----- Prediction labels ----- #
+
+# The target is the pixels newly burned on the day after the input window.
+# label_sel 1: "burned" = accumulated active fire (AF) only.
+# label_sel 0: "burned" = accumulated AF plus the burned-area (BA) band.
+# Like the original TS-SatFire generator, process_data uses each fire's
+# label_sel column from the ROI CSVs (2021 test fires) and this default for
+# fires without one (all train/val fires).
+DEFAULT_LABEL_SEL = 1
+
+# Window repo manifest {"<split>/p<id>.npz": label_sel}. Archives missing from
+# it were built before it existed, with DEFAULT_LABEL_SEL.
+LABEL_SEL_FILE = "label_sel.json"
+
 # ----- Train / validation / test split ----- #
 
 TRAIN_VAL_YEARS = ('2017', '2018', '2019', '2020')

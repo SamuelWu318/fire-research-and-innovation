@@ -96,6 +96,11 @@ def parse_args():
     process.add_argument("--batch-size", type=int, default=10)
     process.add_argument("--overwrite", action="store_true")
     process.add_argument("--debug", action="store_true")
+    process.add_argument(
+        "--ignore-roi-label-sel",
+        action="store_true",
+        help="Use label_sel 1 (active fire only) for every fire instead of the ROI value",
+    )
 
     tessera = subparsers.add_parser(
         "tessera",
@@ -194,6 +199,7 @@ if __name__ == '__main__':
             work_dir=args.work_dir,
             overwrite=args.overwrite,
             debug=args.debug,
+            use_roi_label_sel=not args.ignore_roi_label_sel,
         )
     elif args.command == "tessera":
         process_tessera(
