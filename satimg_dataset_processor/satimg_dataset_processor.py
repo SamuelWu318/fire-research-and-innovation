@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import rasterio
 
+from satimg_dataset_processor.config import TS_INTERVAL, TS_LENGTH
 from satimg_dataset_processor.utils import SatProcessingUtils
 
 class AFBADatasetProcessor(SatProcessingUtils):
@@ -351,8 +352,8 @@ class PredDatasetProcessor(SatProcessingUtils):
         self,
         loc_name,
         local_map,
-        length=10,
-        interval=3,
+        length=TS_LENGTH,
+        interval=TS_INTERVAL,
         label_sel=1,
         debug=False,
     ):

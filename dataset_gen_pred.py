@@ -2,14 +2,16 @@
 
 Each subcommand wraps one function in satimg_dataset_processor.hf_dataset or
 satimg_dataset_processor.tessera. The token defaults to the HF_TOKEN
-environment variable. The four dataset repos (--src-repo, --processed-repo,
---window-repo, --tessera-repo) default to the SamuelWu318 repos.
+environment variable. Defaults come from satimg_dataset_processor/config.py:
+-ts/-it (window length and stride) and the four dataset repos. --window-repo
+defaults to the repo for the chosen -ts/-it (config.window_repo_for).
 
     python dataset_gen_pred.py process -ts 10 -it 3
+    python dataset_gen_pred.py process -ts 6 -it 3      # -> ...-processed-window-ts6-it3
     python dataset_gen_pred.py tessera [--only-fires 21890003 ...]
     python dataset_gen_pred.py tessera-zip
     python dataset_gen_pred.py pull-zip --data-root ./data && python dataset_gen_pred.py pull-tessera --data-root ./data
-    python dataset_gen_pred.py download --data-root ./data [--tessera]
+    python dataset_gen_pred.py download -ts 6 -it 3 --data-root ./data [--tessera]
     python dataset_gen_pred.py upload-zip --data-root ./data [--zip-repo tessera --zip-name data_tessera.zip]
     python dataset_gen_pred.py pull-zip --data-root ./data [--zip-repo processed|window|tessera]
     python dataset_gen_pred.py convert --data-root ./data_processed [--pull]
@@ -18,11 +20,11 @@ environment variable. The four dataset repos (--src-repo, --processed-repo,
 import argparse
 import os
 
+from satimg_dataset_processor.config import TS_INTERVAL, TS_LENGTH, window_repo_for
 from satimg_dataset_processor.hf_dataset import (
     PROCESSED_REPO,
     SRC_REPO,
     TESSERA_REPO,
-    WINDOW_REPO,
     convert_and_upload,
     download_processed_data,
     process_data,
@@ -53,20 +55,38 @@ def parse_args():
         "--window-repo",
         "--dest-repo",
         dest="window_repo",
-        default=WINDOW_REPO,
-        help="Windowed NPZ per fire",
+        default=None,
+        help="Windowed NPZ per fire (default: the repo for -ts/-it)",
     )
     parser.add_argument("--tessera-repo", default=TESSERA_REPO, help="Prior-year TESSERA per fire")
     parser.add_argument("--roi-dir", default="hf_roi")
     parser.add_argument("--work-dir", default=".")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    # Window settings, shared by every command that reads or writes windows.
+    windows = argparse.ArgumentParser(add_help=False)
+    windows.add_argument(
+        "-ts",
+        "--length",
+        dest="ts",
+        type=int,
+        default=TS_LENGTH,
+        help=f"Input days per window (default {TS_LENGTH})",
+    )
+    windows.add_argument(
+        "-it",
+        "--interval",
+        dest="it",
+        type=int,
+        default=TS_INTERVAL,
+        help=f"Days between window starts (default {TS_INTERVAL})",
+    )
+
     process = subparsers.add_parser(
         "process",
+        parents=[windows],
         help="Stream raw fires from --src-repo into windowed NPZs in --window-repo",
     )
-    process.add_argument("-ts", type=int, default=10, help="Length of TS")
-    process.add_argument("-it", type=int, default=3, help="Interval")
     process.add_argument(
         "-mode",
         nargs="+",
@@ -105,6 +125,7 @@ def parse_args():
 
     download = subparsers.add_parser(
         "download",
+        parents=[windows],
         help="Download --window-repo NPZs into --data-root/{train,val,test}",
     )
     download.add_argument("--data-root", default="./data")
@@ -117,6 +138,7 @@ def parse_args():
 
     upload_zip = subparsers.add_parser(
         "upload-zip",
+        parents=[windows],
         help="Zip --data-root and upload it to --zip-repo",
     )
     upload_zip.add_argument("--data-root", default="./data")
@@ -126,6 +148,7 @@ def parse_args():
 
     pull_zip = subparsers.add_parser(
         "pull-zip",
+        parents=[windows],
         help="Download a zip from --zip-repo and extract it into --data-root",
     )
     pull_zip.add_argument("--data-root", default="./data")
@@ -150,6 +173,8 @@ def parse_args():
 
 if __name__ == '__main__':
     args = parse_args()
+    if args.window_repo is None and args.command in ("process", "download", "upload-zip", "pull-zip"):
+        args.window_repo = window_repo_for(args.ts, args.it)
     zip_repos = {
         "window": args.window_repo,
         "processed": args.processed_repo,

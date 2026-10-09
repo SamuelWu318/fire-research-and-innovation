@@ -4,10 +4,12 @@ Ported from the SwinUNETR_data_grab Colab notebook. Repositories, tokens, and
 working directories are arguments rather than notebook globals, so a Colab
 notebook only has to read its secrets and call these functions.
 
-Hugging Face dataset repos:
+Settings (window length/stride, repos, split) live in
+satimg_dataset_processor/config.py. Hugging Face dataset repos:
     SRC_REPO        ts-satfire                   raw GeoTIFFs + ROI CSVs
     PROCESSED_REPO  ts-satfire-processed         old-format NPZ (data/labels) in data.zip
-    WINDOW_REPO     ts-satfire-processed-window  windowed NPZ per fire (training data)
+    WINDOW_REPO     ts-satfire-processed-window  windowed NPZ per fire (training data);
+                    one repo per (TS_LENGTH, TS_INTERVAL), see config.window_repo_for
     TESSERA_REPO    ts-tesserafire               prior-year TESSERA per fire
 
 Typical flow:
@@ -23,6 +25,7 @@ Typical flow:
 """
 
 import gc
+import json
 import os
 import shutil
 import tempfile
@@ -34,22 +37,24 @@ import pandas as pd
 from huggingface_hub import HfApi, hf_hub_download, login
 from tqdm.auto import tqdm
 
+from satimg_dataset_processor.config import (
+    LEGACY_WINDOW_SETTINGS,
+    PROCESSED_REPO,
+    SRC_REPO,
+    TESSERA_REPO,
+    TEST_YEARS,
+    TRAIN_VAL_YEARS,
+    TS_INTERVAL,
+    TS_LENGTH,
+    VAL_IDS,
+    WINDOW_CONFIG_FILE,
+    WINDOW_REPO,
+    window_repo_for,
+)
 from satimg_dataset_processor.satimg_dataset_processor import PredDatasetProcessor
 
 
-SRC_REPO = "SamuelWu318/ts-satfire"
-PROCESSED_REPO = "SamuelWu318/ts-satfire-processed"
-WINDOW_REPO = "SamuelWu318/ts-satfire-processed-window"
-TESSERA_REPO = "SamuelWu318/ts-tesserafire"
 DEST_REPO = WINDOW_REPO  # earlier name for WINDOW_REPO, kept for existing notebooks
-
-VAL_IDS = [
-    '20568194', '20701026', '20562846', '20700973', '24462610',
-    '24462788', '24462753', '24103571', '21998313', '21751303',
-    '22141596', '21999381', '23301962', '22712904', '22713339',
-]
-TRAIN_VAL_YEARS = ('2017', '2018', '2019', '2020')
-TEST_YEARS = ('2021',)
 SPLITS = ("train", "val", "test")
 
 
@@ -115,8 +120,8 @@ class DatasetStreamer(PredDatasetProcessor):
         self,
         target_ids,
         split_name,
-        length=10,
-        interval=3,
+        length=TS_LENGTH,
+        interval=TS_INTERVAL,
         label_sel_by_id=None,
         overwrite=False,
         debug=False,
@@ -305,24 +310,72 @@ def obtain_ids(src_repo=SRC_REPO, token=None, roi_dir="hf_roi"):
     return train_ids, val_ids, test_ids
 
 
+def read_window_config(api, window_repo, token=None):
+    """Return {"ts_length", "ts_interval"} of `window_repo`, or None if unknown.
+
+    Repos created before window_config.json existed hold the original
+    LEGACY_WINDOW_SETTINGS windows.
+    """
+    files = set(api.list_repo_files(window_repo, repo_type="dataset"))
+    if WINDOW_CONFIG_FILE in files:
+        path = hf_hub_download(
+            repo_id=window_repo,
+            filename=WINDOW_CONFIG_FILE,
+            repo_type="dataset",
+            token=token,
+            local_dir=tempfile.mkdtemp(prefix="window_config_"),
+        )
+        with open(path) as handle:
+            return json.load(handle)
+    if any(file_path.split("/")[0] in SPLITS for file_path in files):
+        ts_length, ts_interval = LEGACY_WINDOW_SETTINGS
+        return {"ts_length": ts_length, "ts_interval": ts_interval}
+    return None
+
+
+def ensure_window_config(api, window_repo, length, interval, token=None):
+    """Record the window settings in `window_repo`, refusing to mix settings."""
+    wanted = {"ts_length": int(length), "ts_interval": int(interval)}
+    existing = read_window_config(api, window_repo, token)
+    if existing is not None and existing != wanted:
+        raise ValueError(
+            f"{window_repo} holds windows with {existing}, not {wanted}. Use "
+            f"window_repo_for({length}, {interval}) = "
+            f"{window_repo_for(length, interval)!r} instead."
+        )
+    if WINDOW_CONFIG_FILE not in api.list_repo_files(window_repo, repo_type="dataset"):
+        api.upload_file(
+            path_or_fileobj=json.dumps(wanted, indent=2).encode(),
+            path_in_repo=WINDOW_CONFIG_FILE,
+            repo_id=window_repo,
+            repo_type="dataset",
+        )
+
+
 def process_data(
     token,
     src_repo=SRC_REPO,
-    window_repo=WINDOW_REPO,
+    window_repo=None,
     batch_size=10,
-    length=10,
-    interval=3,
+    length=TS_LENGTH,
+    interval=TS_INTERVAL,
     splits=("train", "val", "test"),
     roi_dir="hf_roi",
     work_dir=".",
     overwrite=False,
     debug=False,
 ):
-    """Stream raw fires from `src_repo` into windowed NPZs in `window_repo`.
+    """Stream raw fires from `src_repo` into windows of `length` input days.
 
-    `token` needs write access to `window_repo`. Fires already present in
-    `window_repo` are skipped unless `overwrite` is set.
+    A new window starts every `interval` days. Windows go to `window_repo`,
+    by default window_repo_for(length, interval), so different settings never
+    share a repo. `token` needs write access to `window_repo`. Fires already
+    present in `window_repo` are skipped unless `overwrite` is set.
     """
+    if window_repo is None:
+        window_repo = window_repo_for(length, interval)
+    print(f"Windows: {length} input days every {interval} days -> {window_repo}")
+
     processor = DatasetStreamer(
         src_repo=src_repo,
         dest_repo=window_repo,
@@ -330,6 +383,7 @@ def process_data(
         batch_size=batch_size,
         work_dir=work_dir,
     )
+    ensure_window_config(processor.api, window_repo, length, interval, token)
 
     # using id metadata from above, split into appropriate folders
     train_ids, val_ids, test_ids = obtain_ids(src_repo, token, roi_dir)
@@ -456,6 +510,8 @@ def download_processed_data(
     returned loader as `excluded_npz`. Use a different `base_output_dir` for
     each mode so a full download never mixes with a TESSERA one.
     """
+    window_config = read_window_config(HfApi(token=token), window_repo, token)
+    print(f"Window repo {window_repo}: {window_config}")
     train_ids, val_ids, test_ids = obtain_ids(src_repo, token, roi_dir)
     excluded_npz = []
     if include_tessera:
@@ -619,12 +675,18 @@ def upload_batch(api, staging_dir, split_name, count, window_repo=WINDOW_REPO):
 def convert_and_upload(
     token,
     data_root="./data",
-    window_repo=WINDOW_REPO,
+    window_repo=None,
     batch_size=10,
     overwrite_existing=False,
     work_dir=".",
 ):
-    """Convert old-format NPZs under <data_root>/{train,val,test} and upload to `window_repo`."""
+    """Convert old-format NPZs under <data_root>/{train,val,test} and upload to `window_repo`.
+
+    The old-format data was built with LEGACY_WINDOW_SETTINGS (10 input days
+    every 3 days), so it goes to that settings' window repo by default.
+    """
+    if window_repo is None:
+        window_repo = window_repo_for(*LEGACY_WINDOW_SETTINGS)
     if not token:
         raise RuntimeError("A Hugging Face write token is required")
 
@@ -638,6 +700,7 @@ def convert_and_upload(
         repo_type="dataset",
         exist_ok=True,
     )
+    ensure_window_config(api, window_repo, *LEGACY_WINDOW_SETTINGS, token=token)
 
     existing_remote_files = set(
         api.list_repo_files(
