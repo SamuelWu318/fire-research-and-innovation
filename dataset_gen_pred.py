@@ -1,57 +1,269 @@
-import pandas as pd
+"""Build the TS-SatFire next-day prediction dataset through Hugging Face.
+
+Each subcommand wraps one function in satimg_dataset_processor.hf_dataset or
+satimg_dataset_processor.tessera. The token defaults to the HF_TOKEN
+environment variable. Defaults come from satimg_dataset_processor/config.py:
+-ts/-it (window length and stride) and the four dataset repos. --window-repo
+defaults to the repo for the chosen -ts/-it (config.window_repo_for).
+
+    python dataset_gen_pred.py process -ts 10 -it 3
+    python dataset_gen_pred.py process -ts 6 -it 3      # -> ...-processed-window-ts6-it3
+    python dataset_gen_pred.py tessera [--only-fires 21890003 ...]
+    python dataset_gen_pred.py tessera-zip
+    python dataset_gen_pred.py pull-zip --data-root ./data && python dataset_gen_pred.py pull-tessera --data-root ./data
+    python dataset_gen_pred.py download -ts 6 -it 3 --data-root ./data [--tessera]
+    python dataset_gen_pred.py upload-zip --data-root ./data [--zip-repo tessera --zip-name data_tessera.zip]
+    python dataset_gen_pred.py pull-zip --data-root ./data [--zip-repo processed|window|tessera]
+    python dataset_gen_pred.py convert --data-root ./data_processed [--pull]
+"""
+
 import argparse
 import os
-from satimg_dataset_processor.satimg_dataset_processor import PredDatasetProcessor
-dfs = []
-for year in ['2017', '2018', '2019', '2020']:
-    filename = 'roi/us_fire_' + year + '_out_new.csv'
-    df = pd.read_csv(filename)
-    dfs.append(df)
-df = pd.concat(dfs, ignore_index=True)
-dfs_test = []
-for year in ['2021']:
-    filename = 'roi/us_fire_' + year + '_out_new.csv'
-    df_test = pd.read_csv(filename)
-    dfs_test.append(df_test)
-df_test = pd.concat(dfs_test, ignore_index=True)
-val_ids = ['20568194', '20701026','20562846','20700973','24462610', '24462788', '24462753', '24103571', '21998313', '21751303', '22141596', '21999381', '23301962', '22712904', '22713339']
 
-df = df.sort_values(by=['Id'])
-df['Id'] = df['Id'].astype(str)
-train_df = df[~df.Id.isin(val_ids)]
-val_df = df[df.Id.isin(val_ids)]
+from satimg_dataset_processor.config import TS_INTERVAL, TS_LENGTH, window_repo_for
+from satimg_dataset_processor.hf_dataset import (
+    PROCESSED_REPO,
+    SRC_REPO,
+    TESSERA_REPO,
+    convert_and_upload,
+    download_processed_data,
+    process_data,
+    pull_processed_data,
+    pull_zip_data_to,
+    upload_data_zip,
+)
+from satimg_dataset_processor.tessera import (
+    process_tessera,
+    pull_tessera_data,
+    upload_tessera_zip,
+)
 
-train_ids = train_df['Id'].values.astype(str)
-val_ids = val_df['Id'].values.astype(str)
 
-df_test = df_test.sort_values(by=['Id'])
-test_ids = df_test['Id'].values.astype(str)
-test_label_sel = df_test['label_sel'].values.astype(int)
+ZIP_REPOS = ("window", "processed", "tessera")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument(
+        "--token",
+        default=os.environ.get("HF_TOKEN"),
+        help="Hugging Face token (default: $HF_TOKEN)",
+    )
+    parser.add_argument("--src-repo", default=SRC_REPO, help="Raw GeoTIFFs + ROI CSVs")
+    parser.add_argument("--processed-repo", default=PROCESSED_REPO, help="Old-format NPZ data.zip")
+    parser.add_argument(
+        "--window-repo",
+        "--dest-repo",
+        dest="window_repo",
+        default=None,
+        help="Windowed NPZ per fire (default: the repo for -ts/-it)",
+    )
+    parser.add_argument("--tessera-repo", default=TESSERA_REPO, help="Prior-year TESSERA per fire")
+    parser.add_argument("--roi-dir", default="hf_roi")
+    parser.add_argument("--work-dir", default=".")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # Window settings, shared by every command that reads or writes windows.
+    windows = argparse.ArgumentParser(add_help=False)
+    windows.add_argument(
+        "-ts",
+        "--length",
+        dest="ts",
+        type=int,
+        default=TS_LENGTH,
+        help=f"Input days per window (default {TS_LENGTH})",
+    )
+    windows.add_argument(
+        "-it",
+        "--interval",
+        dest="it",
+        type=int,
+        default=TS_INTERVAL,
+        help=f"Days between window starts (default {TS_INTERVAL})",
+    )
+
+    process = subparsers.add_parser(
+        "process",
+        parents=[windows],
+        help="Stream raw fires from --src-repo into windowed NPZs in --window-repo",
+    )
+    process.add_argument(
+        "-mode",
+        nargs="+",
+        choices=("train", "val", "test"),
+        default=["train", "val", "test"],
+    )
+    process.add_argument("--batch-size", type=int, default=10)
+    process.add_argument("--overwrite", action="store_true")
+    process.add_argument("--debug", action="store_true")
+    process.add_argument(
+        "--ignore-roi-label-sel",
+        action="store_true",
+        help="Use label_sel 1 (active fire only) for every fire instead of the ROI value",
+    )
+
+    tessera = subparsers.add_parser(
+        "tessera",
+        help="Build prior-year TESSERA embeddings per fire into --tessera-repo",
+    )
+    tessera.add_argument(
+        "-mode",
+        nargs="+",
+        choices=("train", "val", "test"),
+        default=["train", "val", "test"],
+    )
+    tessera.add_argument("--batch-size", type=int, default=1)
+    tessera.add_argument("--strip-rows", type=int, default=128)
+    tessera.add_argument("--overwrite", action="store_true")
+    tessera.add_argument("--only-fires", nargs="+", help="Restrict to these fire IDs (timing test)")
+
+    subparsers.add_parser(
+        "tessera-zip",
+        help="Bundle --tessera-repo tessera/ and the drop list into tessera.zip there",
+    )
+    pull_tessera = subparsers.add_parser(
+        "pull-tessera",
+        help="Unpack tessera.zip into --data-root/tessera and drop 2017 window archives",
+    )
+    pull_tessera.add_argument("--data-root", default="./data")
+    pull_tessera.add_argument("--keep-excluded", action="store_true")
+
+    download = subparsers.add_parser(
+        "download",
+        parents=[windows],
+        help="Download --window-repo NPZs into --data-root/{train,val,test}",
+    )
+    download.add_argument("--data-root", default="./data")
+    download.add_argument(
+        "--tessera",
+        action="store_true",
+        help="TESSERA mode: drop fires without prior-year TESSERA and download "
+        "--tessera-repo embeddings into --data-root/tessera",
+    )
+
+    upload_zip = subparsers.add_parser(
+        "upload-zip",
+        parents=[windows],
+        help="Zip --data-root and upload it to --zip-repo",
+    )
+    upload_zip.add_argument("--data-root", default="./data")
+    upload_zip.add_argument("--zip-path", default="./data.zip")
+    upload_zip.add_argument("--zip-repo", choices=ZIP_REPOS, default="window")
+    upload_zip.add_argument("--zip-name", default="data.zip", help="data_tessera.zip for TESSERA mode")
+
+    pull_zip = subparsers.add_parser(
+        "pull-zip",
+        parents=[windows],
+        help="Download a zip from --zip-repo and extract it into --data-root",
+    )
+    pull_zip.add_argument("--data-root", default="./data")
+    pull_zip.add_argument("--zip-repo", choices=ZIP_REPOS, default="window")
+    pull_zip.add_argument("--zip-name", default="data.zip")
+
+    convert = subparsers.add_parser(
+        "convert",
+        help="Convert old-format NPZs under --data-root and upload them to --window-repo",
+    )
+    convert.add_argument("--data-root", default="./data_processed")
+    convert.add_argument(
+        "--pull",
+        action="store_true",
+        help="First pull data.zip from --processed-repo into --data-root",
+    )
+    convert.add_argument("--batch-size", type=int, default=10)
+    convert.add_argument("--overwrite", action="store_true")
+
+    return parser.parse_args()
+
+
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Process some integers.')
-    parser.add_argument('-mode', type=str, help='Train/Val/Test')
-    parser.add_argument('-ts', type=int, help='Length of TS')
-    parser.add_argument('-it', type=int, help='Interval')
-    args = parser.parse_args()
-    ts_length = args.ts
-    interval = args.it
-    modes = args.mode
-    if modes == 'train':
-        locations = train_ids
-    elif modes == 'val':
-        locations = val_ids
-    else:
-        locations = test_ids
-    usecase='pred'
-    satimg_processor = PredDatasetProcessor()
-    if modes in ['train', 'val']:
-        satimg_processor.pred_dataset_generator_seqtoseq(mode=modes, locations=locations, visualize=False, data_path='/home/z/h/zhao2/CalFireMonitoring/data/',
-                                                file_name=usecase+'_'+modes+'_img_seqtoseq_alll_'+str(ts_length)+'i_'+str(interval)+'.npy',
-                                                label_name=usecase+'_'+modes+'_label_seqtoseq_alll_'+str(ts_length)+'i_'+str(interval)+'.npy',
-                                                save_path = 'dataset/dataset_'+modes, ts_length=ts_length, 
-                                                interval=interval, image_size=(256, 256))
-    else:
-        for i, id in enumerate(locations):
-            print(id)
-            satimg_processor.pred_dataset_generator_seqtoseq(mode = 'test', locations=[id], visualize=False, data_path='/home/z/h/zhao2/CalFireMonitoring/data/',file_name=usecase+'_'+id+'_img_seqtoseql_'+str(ts_length)+'i_'+str(interval)+'.npy', label_name=usecase+'_'+id+'_label_seqtoseql_'+str(ts_length)+'i_'+str(interval)+'.npy',
-                                                           save_path='dataset/dataset_test', ts_length=ts_length, interval=interval, rs_idx=0.3, cs_idx=0.3, image_size=(256, 256), label_sel=test_label_sel[i])
+    args = parse_args()
+    if args.window_repo is None and args.command in ("process", "download", "upload-zip", "pull-zip"):
+        args.window_repo = window_repo_for(args.ts, args.it)
+    zip_repos = {
+        "window": args.window_repo,
+        "processed": args.processed_repo,
+        "tessera": args.tessera_repo,
+    }
+
+    if args.command == "process":
+        process_data(
+            args.token,
+            src_repo=args.src_repo,
+            window_repo=args.window_repo,
+            batch_size=args.batch_size,
+            length=args.ts,
+            interval=args.it,
+            splits=args.mode,
+            roi_dir=args.roi_dir,
+            work_dir=args.work_dir,
+            overwrite=args.overwrite,
+            debug=args.debug,
+            use_roi_label_sel=not args.ignore_roi_label_sel,
+        )
+    elif args.command == "tessera":
+        process_tessera(
+            args.token,
+            src_repo=args.src_repo,
+            tessera_repo=args.tessera_repo,
+            splits=args.mode,
+            batch_size=args.batch_size,
+            work_dir=args.work_dir,
+            roi_dir=args.roi_dir,
+            overwrite=args.overwrite,
+            strip_rows=args.strip_rows,
+            only_fires=args.only_fires,
+        )
+    elif args.command == "tessera-zip":
+        upload_tessera_zip(
+            args.token,
+            src_repo=args.src_repo,
+            tessera_repo=args.tessera_repo,
+            work_dir=args.work_dir,
+            roi_dir=args.roi_dir,
+        )
+    elif args.command == "pull-tessera":
+        pull_tessera_data(
+            args.data_root,
+            token=args.token,
+            tessera_repo=args.tessera_repo,
+            drop_excluded=not args.keep_excluded,
+        )
+    elif args.command == "download":
+        download_processed_data(
+            args.token,
+            window_repo=args.window_repo,
+            src_repo=args.src_repo,
+            base_output_dir=args.data_root,
+            roi_dir=args.roi_dir,
+            include_tessera=args.tessera,
+            tessera_repo=args.tessera_repo,
+        )
+    elif args.command == "upload-zip":
+        upload_data_zip(
+            args.token,
+            data_root=args.data_root,
+            zip_path=args.zip_path,
+            repo_id=zip_repos[args.zip_repo],
+            zip_name=args.zip_name,
+        )
+    elif args.command == "pull-zip":
+        # The zips store their folders (train/, val/, test/, ...) at the root.
+        pull_zip_data_to(
+            args.data_root,
+            token=args.token,
+            repo_id=zip_repos[args.zip_repo],
+            download_dir=args.data_root,
+            zip_name=args.zip_name,
+        )
+    elif args.command == "convert":
+        if args.pull:
+            pull_processed_data(args.data_root, token=args.token, processed_repo=args.processed_repo)
+        convert_and_upload(
+            args.token,
+            data_root=args.data_root,
+            window_repo=args.window_repo,
+            batch_size=args.batch_size,
+            overwrite_existing=args.overwrite,
+            work_dir=args.work_dir,
+        )

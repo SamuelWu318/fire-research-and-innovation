@@ -55,6 +55,39 @@ class Normalize:
         return sample
 
 
+# * NEW: TESSERA files hold 128 embedding bands; one validity mask is added.
+TESSERA_BANDS = 128
+TESSERA_CHANNELS = TESSERA_BANDS + 1
+
+
+def compute_tessera_stats(tessera_paths, min_coverage=0.5):
+    """Per-band mean/std over well-covered pixels of the given TESSERA files.
+
+    Compute this from the training fires only and reuse it for validation and
+    test, so no statistics leak from held-out fires.
+    """
+    total = np.zeros(TESSERA_BANDS, dtype=np.float64)
+    total_sq = np.zeros(TESSERA_BANDS, dtype=np.float64)
+    count = 0
+    for path in tessera_paths:
+        with np.load(path, allow_pickle=False) as archive:
+            embedding = archive["embedding"].astype(np.float64)
+            valid = archive["coverage"].astype(np.float32) >= min_coverage
+        values = embedding[:, valid]
+        total += values.sum(axis=1)
+        total_sq += (values ** 2).sum(axis=1)
+        count += values.shape[1]
+    if count == 0:
+        raise RuntimeError("No TESSERA pixels with sufficient coverage")
+    mean = total / count
+    std = np.sqrt(np.maximum(total_sq / count - mean ** 2, 1e-12))
+    return {
+        "mean": mean.astype(np.float32),
+        "std": std.astype(np.float32),
+        "min_coverage": float(min_coverage),
+    }
+
+
 class FireDataset(Dataset):
     """Expose every temporal window across every fire as one Dataset item.
 
@@ -80,6 +113,8 @@ class FireDataset(Dataset):
         n_channel=27,
         label_sel=0,
         target_is_single_day=False,
+        tessera_dir=None,
+        tessera_stats=None,
     ):
         # * NEW: data and labels now live together in version-2 NPZ files.
         self.npz_dir = Path(npz_dir)
@@ -87,6 +122,24 @@ class FireDataset(Dataset):
 
         if not self.npz_files:
             raise RuntimeError(f"No .npz files found in {self.npz_dir}")
+
+        # * NEW: optional TESSERA mode. Each fire archive p<id>.npz pairs with
+        # * NEW: <tessera_dir>/p<id>.npz; None keeps the 27-channel behavior.
+        self.tessera_dir = Path(tessera_dir) if tessera_dir is not None else None
+        self.tessera_stats = tessera_stats
+        if self.tessera_dir is not None:
+            if tessera_stats is None:
+                raise ValueError("tessera_stats is required with tessera_dir")
+            missing = [
+                path.name
+                for path in self.npz_files
+                if not (self.tessera_dir / path.name).exists()
+            ]
+            if missing:
+                raise RuntimeError(
+                    f"{len(missing)} archives in {self.npz_dir} have no TESSERA "
+                    f"file in {self.tessera_dir}: {missing[:10]}"
+                )
 
         # - OLD: retain these options so existing training configuration and
         # - OLD: FireDataset calls continue to express the same behavior.
@@ -231,6 +284,12 @@ class FireDataset(Dataset):
         # - OLD: channels are excluded from this normalization operation.
         x = self.normalizer(x)
 
+        # * NEW: append the fire's TESSERA channels after the 27 stored ones,
+        # * NEW: before augmentation so they flip and rotate with the image.
+        # * NEW: Appending keeps the degree and land-cover indices unchanged.
+        if self.tessera_dir is not None:
+            x = torch.cat((x, self.load_tessera(idx, x.shape[1])), dim=0)
+
         # - OLD: augment training examples but leave validation unchanged.
         if self.use_augmentations:
             x, y = self.augment(x, y)
@@ -332,6 +391,36 @@ class FireDataset(Dataset):
         ).long()
 
         return x, y
+
+    def load_tessera(self, idx, ts_length):
+        """Return (129, T, H, W): normalized embedding plus validity mask.
+
+        Pixels whose TESSERA coverage is below the training threshold are
+        zeroed (the normalized mean) and marked 0 in the mask channel. The
+        static map is repeated across all T input days.
+        """
+        npz_path, _ = self.index[idx]
+        tessera_path = self.tessera_dir / npz_path.name
+        with np.load(tessera_path, allow_pickle=False) as archive:
+            embedding = archive["embedding"].astype(np.float32)
+            coverage = archive["coverage"].astype(np.float32)
+
+        if embedding.shape != (TESSERA_BANDS, 256, 256):
+            raise ValueError(
+                f"{tessera_path}: embedding has shape {embedding.shape}; "
+                f"expected ({TESSERA_BANDS}, 256, 256)"
+            )
+
+        mean = self.tessera_stats["mean"][:, None, None]
+        std = self.tessera_stats["std"][:, None, None]
+        valid = coverage >= self.tessera_stats["min_coverage"]
+        embedding = np.where(valid, (embedding - mean) / std, 0.0)
+
+        static = np.concatenate(
+            (embedding, valid[None].astype(np.float32)),
+            axis=0,
+        ).astype(np.float32)
+        return torch.from_numpy(static).unsqueeze(1).expand(-1, ts_length, -1, -1)
 
     def preprocess(self, x):
         # - OLD: transform angular degree features after augmentation.

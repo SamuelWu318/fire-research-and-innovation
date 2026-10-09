@@ -3,20 +3,175 @@ from glob import glob
 
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
+import rasterio
 
+from satimg_dataset_processor.config import TS_INTERVAL, TS_LENGTH
 from satimg_dataset_processor.utils import SatProcessingUtils
 
 class AFBADatasetProcessor(SatProcessingUtils):
+    def _load_roi_lookup(self, roi_dir='roi'):
+        roi_lookup = {}
+        for csv_path in sorted(glob(os.path.join(roi_dir, '*.csv'))):
+            try:
+                df = pd.read_csv(csv_path)
+            except Exception:
+                continue
+            if 'Id' not in df.columns:
+                continue
+            cols = ['Id', 'start_date', 'lat', 'lon']
+            available = [c for c in cols if c in df.columns]
+            if not available:
+                continue
+            subset = df[available].dropna(subset=['Id', 'start_date', 'lat', 'lon'])
+            for _, row in subset.iterrows():
+                fire_id = str(int(float(row['Id']))) if pd.notna(row['Id']) else str(row['Id'])
+                roi_lookup[fire_id] = {
+                    'start_date': row['start_date'],
+                    'lat': float(row['lat']),
+                    'lon': float(row['lon']),
+                }
+        return roi_lookup
+
+    def _build_centroid_bbox(self, lat, lon, pad_deg=0.02):
+        return {
+            'min_lat': max(-90.0, lat - pad_deg),
+            'max_lat': min(90.0, lat + pad_deg),
+            'min_lon': max(-180.0, lon - pad_deg),
+            'max_lon': min(180.0, lon + pad_deg),
+        }
+
+    def _read_tessera_geotiffs(self, geotiff_dir):
+        geo_files = sorted(glob(os.path.join(geotiff_dir, '*.tif')) + glob(os.path.join(geotiff_dir, '*.tiff')))
+        if not geo_files:
+            return None
+        arrays = []
+        for geo_file in geo_files:
+            with rasterio.open(geo_file, 'r') as reader:
+                band_arr = reader.read()
+            if band_arr.ndim == 2:
+                band_arr = band_arr[np.newaxis, :, :]
+            arrays.append(band_arr.astype(np.float32))
+        stacked = np.concatenate(arrays, axis=0) if arrays else np.zeros((128, 1, 1), dtype=np.float32)
+        if stacked.shape[0] > 128:
+            stacked = stacked[:128]
+        if stacked.shape[0] < 128:
+            pad = np.zeros((128 - stacked.shape[0], *stacked.shape[1:]), dtype=np.float32)
+            stacked = np.concatenate((stacked, pad), axis=0)
+        return stacked
+
+    def _pool_tessera_to_coarse_grid(self, tessera_embedding, coarse_shape=(256, 256)):
+        if tessera_embedding.ndim == 1:
+            tessera_embedding = tessera_embedding[:, np.newaxis, np.newaxis]
+        if tessera_embedding.shape[0] != 128:
+            if tessera_embedding.shape[-1] == 128:
+                tessera_embedding = np.moveaxis(tessera_embedding, -1, 0)
+            elif tessera_embedding.shape[0] == 1 and tessera_embedding.shape[1] == 128:
+                tessera_embedding = tessera_embedding.reshape(128, -1)
+        if tessera_embedding.shape[0] != 128:
+            raise ValueError(f'Expected 128 TESSERA bands, got shape {tessera_embedding.shape}.')
+
+        height, width = tessera_embedding.shape[1], tessera_embedding.shape[2]
+        target_h, target_w = coarse_shape
+        block_h = max(1, int(np.ceil(height / target_h)))
+        block_w = max(1, int(np.ceil(width / target_w)))
+        pooled = np.zeros((128, target_h, target_w), dtype=np.float32)
+        for i in range(target_h):
+            y0 = i * block_h
+            y1 = min(height, (i + 1) * block_h)
+            if y0 >= height:
+                continue
+            for j in range(target_w):
+                x0 = j * block_w
+                x1 = min(width, (j + 1) * block_w)
+                if x0 >= width:
+                    continue
+                window = tessera_embedding[:, y0:y1, x0:x1]
+                pooled[:, i, j] = np.nanmean(window.reshape(128, -1), axis=1)
+        return pooled
+
+    def _fetch_tessera_embedding_for_fire(self, fire_id, lat, lon, start_date, cache_dir='tessera_cache'):
+        try:
+            start_dt = pd.to_datetime(start_date)
+        except Exception:
+            raise ValueError(f'Invalid start_date for fire {fire_id}: {start_date!r}.')
+
+        prior_year = int(start_dt.year) - 1
+        if prior_year < 2017:
+            raise ValueError(f'No supported prior-year TESSERA data for {fire_id} (year {prior_year}).')
+
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_path = os.path.join(cache_dir, f'{fire_id}_{prior_year}.npz')
+        if os.path.exists(cache_path):
+            with np.load(cache_path) as cached:
+                return cached['embedding']
+
+        try:
+            import geotessera as gt
+        except ImportError:
+            raise RuntimeError(f'geotessera is required for TESSERA augmentation ({fire_id}).')
+
+        bbox = self._build_centroid_bbox(float(lat), float(lon))
+        export_dir = os.path.join(cache_dir, f'{fire_id}_{prior_year}')
+        os.makedirs(export_dir, exist_ok=True)
+        try:
+            tessera = gt.GeoTessera()
+            tiles = gt.registry.load_blocks_for_region(
+                bounds=(bbox['min_lon'], bbox['min_lat'], bbox['max_lon'], bbox['max_lat']),
+                year=prior_year,
+            )
+            if tiles is not None:
+                tessera.export_embedding_geotiffs(tiles, export_dir, bands=None)
+                embedding = self._read_tessera_geotiffs(export_dir)
+            else:
+                raise ValueError('No TESSERA tiles found for the fire region.')
+        except Exception:
+            tessera = gt.GeoTessera()
+            try:
+                embedding = np.asarray(tessera.fetch_embedding(float(lat), float(lon), prior_year), dtype=np.float32)
+            except Exception:
+                raise RuntimeError(f'Could not fetch TESSERA embedding for {fire_id} in year {prior_year}.')
+
+        if embedding is None:
+            raise RuntimeError(f'No TESSERA embedding found for {fire_id} in year {prior_year}.')
+
+        if embedding.ndim == 1:
+            embedding = embedding[:, np.newaxis, np.newaxis]
+        if embedding.shape[-1] == 128 and embedding.ndim == 3:
+            embedding = np.moveaxis(embedding, -1, 0)
+        pooled = self._pool_tessera_to_coarse_grid(embedding, coarse_shape=(256, 256))
+        np.savez_compressed(cache_path, embedding=pooled)
+        return pooled
+
     def dataset_generator_seqtoseq(self, mode, usecase, data_path, locations, file_name, label_name, save_path, rs_idx=0, cs_idx=0,
-                                               visualize=True, ts_length=10, interval=3, image_size=(224, 224)):
+                                               visualize=True, ts_length=10, interval=3, image_size=(224, 224), use_tessera_embeddings=False):
         satellite_day = 'VIIRS_Day'
         stack_over_location = []
         stack_label_over_locations = []
-        n_channels = 8
+        base_n_channels = 8
+        n_channels = base_n_channels
+        tessera_n_channels = 128 if use_tessera_embeddings else 0
+        roi_lookup = self._load_roi_lookup() if use_tessera_embeddings else {}
         if not os.path.exists(save_path):
             os.mkdir(save_path)
         for location in locations:
             print(location)
+            fire_id = str(location)
+            fire_meta = roi_lookup.get(fire_id)
+            tessera_channels = None
+            if use_tessera_embeddings:
+                if fire_meta is None:
+                    raise KeyError(f'No ROI metadata (start_date/lat/lon) found for fire {fire_id}.')
+                tessera_channels = self._fetch_tessera_embedding_for_fire(
+                    fire_id=fire_id,
+                    lat=fire_meta['lat'],
+                    lon=fire_meta['lon'],
+                    start_date=fire_meta['start_date'],
+                    cache_dir='tessera_cache',
+                )
+                if tessera_channels is None or tessera_channels.shape != (128, 256, 256):
+                    raise ValueError(f'Invalid TESSERA embedding for fire {fire_id}: '
+                                     f'{None if tessera_channels is None else tessera_channels.shape}.')
             study_area_path = data_path + '/' + location + '/' + satellite_day + '/'
             file_list = glob(study_area_path + '/*.tif')
             file_list.sort()
@@ -45,7 +200,7 @@ class AFBADatasetProcessor(SatProcessingUtils):
                     i=file_list_size-ts_length
                     print('append the tail')
                     # break
-                output_array = np.zeros((ts_length, n_channels, output_shape_x, output_shape_y), dtype=np.float32)
+                output_array = np.zeros((ts_length, base_n_channels + tessera_n_channels, output_shape_x, output_shape_y), dtype=np.float32)
                 output_label = np.zeros((ts_length, 3, output_shape_x, output_shape_y), dtype=np.float32)
                 for j in range(ts_length):
                     file = file_list[j + i]
@@ -89,7 +244,9 @@ class AFBADatasetProcessor(SatProcessingUtils):
                     if j == interval-1:
                         new_base_acc_label = af_acc_label
                         new_base_ba_label = ba_label
-                    output_array[j, :n_channels, :, :] = img
+                    output_array[j, :base_n_channels, :, :] = img
+                    if use_tessera_embeddings and tessera_channels is not None:
+                        output_array[j, base_n_channels:, :, :] = tessera_channels
                     output_label[j, 0, :, :] = label
                     output_label[j, 1, :, :] = af_acc_label
                     output_label[j, 2, :, :] = af
@@ -126,7 +283,7 @@ class AFBADatasetProcessor(SatProcessingUtils):
         labels_stacked_over_locations = np.concatenate(stack_label_over_locations, axis=0).transpose((0,2,1,3,4))
         del stack_over_location
         del stack_label_over_locations
-        for i in range(8):
+        for i in range(dataset_stacked_over_locations.shape[1]):
             print(np.nanmean(dataset_stacked_over_locations[:,i,:,:,:]))
             print(np.nanstd(dataset_stacked_over_locations[:,i,:,:,:]))
         np.save(save_path + '/' + file_name, dataset_stacked_over_locations.astype(np.float32))
@@ -134,123 +291,332 @@ class AFBADatasetProcessor(SatProcessingUtils):
 
 
 class PredDatasetProcessor(SatProcessingUtils):
-    def pred_dataset_generator_seqtoseq(self, mode, locations, data_path, file_name, label_name, save_path, rs_idx=0, cs_idx=0,
-                                               visualize=True, ts_length=10, interval=3, image_size=(224, 224), label_sel=1):
-        satellite_day = 'VIIRS_Day'
-        stack_over_location = []
-        stack_label_over_locations = []
-        n_channels = 8+19
-        if not os.path.exists(save_path):
-            os.mkdir(save_path)
-        for location in locations:
-            print(location)
-            data_day_path = data_path + location + '/' + satellite_day + '/'
-            file_list = glob(data_day_path + '/*.tif')
-            file_list.sort()
-            if len(file_list) == 0:
-                print('empty file list')
-                continue
-            array_day, _ = self.read_tiff(file_list[0])
-            array_stack = []
-            label_stack = []
+    """Turn one fire's GeoTIFFs into window-addressable prediction samples."""
 
-            output_shape_x = 256
-            output_shape_y = 256
-            offset=128
-            
-            original_shape_x = array_day.shape[1]
-            original_shape_y = array_day.shape[2]
+    @staticmethod
+    def _binary_label(array):
+        """Treat NaN, infinity, zero, and negative nodata as background."""
+        return np.isfinite(array) & (array > 0)
 
-            ba_label = np.zeros((output_shape_x, output_shape_y))
-            af_acc_label = np.zeros((output_shape_x, output_shape_y))
-            new_base_acc_label = af_acc_label
-            new_base_ba_label = ba_label
-            max_img = np.zeros((n_channels, output_shape_x, output_shape_y), dtype=np.float32)
-            file_list_size = len(file_list)
-            for i in range(0, file_list_size, interval):
-                if i + ts_length >= file_list_size:
-                    print('drop the tail')
-                    break
-                output_array = np.zeros((ts_length, n_channels, output_shape_x, output_shape_y), dtype=np.float32)
-                output_label = np.zeros((output_shape_x, output_shape_y), dtype=np.float32)
-                for j in range(ts_length+1):
-                    file = file_list[j + i]
-                    array_day, _ = self.read_tiff(file)
-                    if os.path.exists(file.replace('VIIRS_Day', 'VIIRS_Night')):
-                        array_night, _ = self.read_tiff(file.replace('VIIRS_Day', 'VIIRS_Night'))
-                        if array_night.shape[0] == 5:
-                            print('Day_night miss align')
-                            array_night = array_night[3:, :, :]
-                        if array_night.shape[0] < 2:
-                            print(file.replace('VIIRS_Day', 'VIIRS_Night'), 'band incomplete')
-                            continue
-                        if array_night.shape[1] != array_day.shape[1] or array_night.shape[2] != array_day.shape[2]:
-                            print('Day Night not match')
-                            print(file)
-                    else:
-                        array_night = np.zeros((2, original_shape_x, original_shape_y))
-                    array_pred, _ = self.read_tiff(file.replace('VIIRS_Day', 'FirePred'))
-                    img = np.concatenate((array_day[:6, offset:output_shape_x+offset, offset:output_shape_y+offset], array_night[:, offset:output_shape_x+offset, offset:output_shape_y+offset], array_pred[:, offset:output_shape_x+offset, offset:output_shape_y+offset]), axis=0)
-                    img = (img[:,:output_shape_x, :output_shape_y])
-                    max_img = np.maximum(img, max_img)
-                    img = np.concatenate((img[:3,...],max_img[3:5,...],img[[5],...],max_img[6:8,...],img[8:,...]))
-                    ba_img = img[3,:,:]
-                    if array_day.shape[0]==8:
-                        label = (array_day[7, :, :])
-                    else:
-                        label = np.zeros((output_shape_x, output_shape_y))
-                    af= array_day[6, :, :]
+    @staticmethod
+    def _save_windowed_npz(save_path, data, labels, label_sel=None):
+        """Save each temporal window as its own compressed NPZ member.
 
-                    ba_img = (ba_img-ba_img.min())/(ba_img.max()-ba_img.min())
-                    label = (label[offset:output_shape_x+offset, offset:output_shape_y+offset])
-                    af = (af[offset:output_shape_x+offset, offset:output_shape_y+offset])
-                    ba_label = np.logical_or(label, ba_label)
-                    af_acc_label = np.logical_or(af, af_acc_label)
-                    if label_sel==1:
-                        final_label = af_acc_label
+        Unlike saving `data` as one five-dimensional member, this layout lets
+        a Dataset decompress only the requested window during __getitem__.
+        The dictionary values below are views, so constructing `payload` does
+        not duplicate the complete fire in memory.
+        """
+        if len(data) != len(labels):
+            raise ValueError(
+                f"Data/label window mismatch: {len(data)} versus "
+                f"{len(labels)}"
+            )
+
+        number_of_windows = len(data)
+        payload = {
+            "format_version": np.asarray(2, dtype=np.int16),
+            "num_windows": np.asarray(number_of_windows, dtype=np.int32),
+        }
+        if label_sel is not None:
+            # Records which label rule built the targets; readers ignore it.
+            payload["label_sel"] = np.asarray(label_sel, dtype=np.int16)
+
+        for window_idx in range(number_of_windows):
+            suffix = f"{window_idx:03d}"
+            payload[f"data_{suffix}"] = data[window_idx]
+            payload[f"label_{suffix}"] = labels[window_idx]
+
+        np.savez_compressed(save_path, **payload)
+
+        # This checks the ZIP member index and tiny metadata member without
+        # decompressing every data window again.
+        with np.load(save_path, allow_pickle=False) as archive:
+            saved_count = int(archive["num_windows"])
+            expected_keys = {
+                key
+                for window_idx in range(number_of_windows)
+                for key in (
+                    f"data_{window_idx:03d}",
+                    f"label_{window_idx:03d}",
+                )
+            }
+            missing_keys = expected_keys.difference(archive.files)
+
+        if saved_count != number_of_windows or missing_keys:
+            raise RuntimeError(
+                f"Failed to verify {save_path}: saved_count={saved_count}, "
+                f"missing={sorted(missing_keys)}"
+            )
+
+        return number_of_windows
+
+    def process_location(
+        self,
+        loc_name,
+        local_map,
+        length=TS_LENGTH,
+        interval=TS_INTERVAL,
+        label_sel=1,
+        debug=False,
+    ):
+        """Build (windows, C, T, H, W) inputs and (windows, H, W) targets.
+
+        `local_map` maps each source file name to a local path. Only entries
+        whose source name contains "VIIRS_Day" are used as frames; the
+        matching VIIRS_Night and FirePred files are found next to them.
+        """
+        day_files = sorted(
+            path
+            for remote_name, path in local_map.items()
+            if "VIIRS_Day" in remote_name
+        )
+
+        if not day_files:
+            print(f"{loc_name}: no VIIRS_Day files")
+            return None, None
+
+        array_stack = []
+        label_stack = []
+
+        n_channels = 27
+        output_shape_x = 256
+        output_shape_y = 256
+        offset = 128
+
+        # Label accumulators must be Boolean. Raw NaNs must never be passed
+        # directly to np.logical_or because bool(np.nan) is True.
+        ba_label = np.zeros(
+            (output_shape_x, output_shape_y),
+            dtype=bool,
+        )
+        af_acc_label = np.zeros_like(ba_label)
+        new_base_acc_label = af_acc_label.copy()
+        new_base_ba_label = ba_label.copy()
+
+        max_img = np.zeros(
+            (n_channels, output_shape_x, output_shape_y),
+            dtype=np.float32,
+        )
+        new_base_max_img = max_img.copy()
+
+        for i in range(0, len(day_files), interval):
+            # A window needs `length` input frames plus one target frame.
+            if i + length >= len(day_files):
+                print(f"{loc_name}: dropping incomplete tail")
+                break
+
+            output_array = np.zeros(
+                (
+                    length,
+                    n_channels,
+                    output_shape_x,
+                    output_shape_y,
+                ),
+                dtype=np.float32,
+            )
+            output_label = np.zeros(
+                (output_shape_x, output_shape_y),
+                dtype=np.float32,
+            )
+
+            for j in range(length + 1):
+                file_name = day_files[i + j]
+                array_day, _ = self.read_tiff(file_name)
+
+                if array_day.shape[0] < 7:
+                    raise ValueError(
+                        f"{file_name}: expected at least 7 day bands, "
+                        f"found {array_day.shape[0]}"
+                    )
+
+                original_shape_x = array_day.shape[1]
+                original_shape_y = array_day.shape[2]
+
+                night_file = file_name.replace(
+                    "VIIRS_Day",
+                    "VIIRS_Night",
+                )
+                if os.path.exists(night_file):
+                    array_night, _ = self.read_tiff(night_file)
+                    if array_night.shape[0] == 5:
+                        print(f"{night_file}: correcting day/night alignment")
+                        array_night = array_night[3:, :, :]
+
+                    if array_night.shape[0] < 2:
+                        raise ValueError(
+                            f"{night_file}: expected at least 2 bands, "
+                            f"found {array_night.shape[0]}"
+                        )
+
+                    if array_night.shape[1:] != array_day.shape[1:]:
+                        raise ValueError(
+                            f"Day/night spatial mismatch for {file_name}: "
+                            f"{array_day.shape[1:]} versus "
+                            f"{array_night.shape[1:]}"
+                        )
+                else:
+                    array_night = np.zeros(
+                        (2, original_shape_x, original_shape_y),
+                        dtype=np.float32,
+                    )
+
+                pred_file = file_name.replace(
+                    "VIIRS_Day",
+                    "FirePred",
+                )
+                array_pred, _ = self.read_tiff(pred_file)
+
+                row_slice = slice(offset, offset + output_shape_x)
+                col_slice = slice(offset, offset + output_shape_y)
+
+                img = np.concatenate(
+                    (
+                        array_day[:6, row_slice, col_slice],
+                        array_night[:, row_slice, col_slice],
+                        array_pred[:, row_slice, col_slice],
+                    ),
+                    axis=0,
+                )
+                img = img[:, :output_shape_x, :output_shape_y]
+
+                expected_shape = (
+                    n_channels,
+                    output_shape_x,
+                    output_shape_y,
+                )
+                if img.shape != expected_shape:
+                    raise ValueError(
+                        f"{file_name}: expected cropped input shape "
+                        f"{expected_shape}, found {img.shape}"
+                    )
+
+                # Model inputs must be finite before maximum accumulation.
+                img = np.nan_to_num(
+                    img,
+                    copy=False,
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                )
+
+                max_img = np.maximum(img, max_img)
+                img = np.concatenate(
+                    (
+                        img[:3, ...],
+                        max_img[3:5, ...],
+                        img[[5], ...],
+                        max_img[6:8, ...],
+                        img[8:, ...],
+                    ),
+                    axis=0,
+                )
+
+                af_raw = array_day[6, row_slice, col_slice]
+                if array_day.shape[0] >= 8:
+                    ba_raw = array_day[7, row_slice, col_slice]
+                else:
+                    ba_raw = np.zeros(
+                        (output_shape_x, output_shape_y),
+                        dtype=np.float32,
+                    )
+
+                # Critical fix: create explicit masks before accumulation.
+                # np.logical_or on raw arrays would interpret NaN as True.
+                af = self._binary_label(af_raw)
+                ba = self._binary_label(ba_raw)
+
+                if debug:
+                    af_full = self._binary_label(array_day[6])
+                    if array_day.shape[0] >= 8:
+                        ba_full = self._binary_label(array_day[7])
                     else:
-                        final_label = np.logical_or(af_acc_label, ba_label)
-                    
-                    if j == interval-1:
-                        new_base_acc_label = af_acc_label
-                        new_base_ba_label = ba_label
-                    if j <ts_length:
-                        prev_final_label = final_label.copy()
-                        output_array[j, :n_channels, :, :] = img
-                    if j == ts_length:
-                        output_label[:, :] = np.where(np.logical_and(prev_final_label==0, final_label>0), 1, 0)
-                    if visualize and j == ts_length:
-                        plt.figure(figsize=(8, 4), dpi=80)
-                        plt.subplot(121)
-                        plt.imshow(ba_img)
-                        plt.axis('off')
-                        plt.title('Band I4 Day')
-                        plt.subplot(122)
-                        plt.imshow(ba_img)
-                        plt.imshow(np.where(output_label[:, :]==0, np.nan, 1), cmap='hsv', interpolation='nearest', alpha=1)
-                        plt.axis('off')
-                        plt.title('BA next day')
-                        plt.savefig(save_path+'_figure/'+location+'_sequence_'+str(i)+'_time_'+str(j)+'_ts_'+str(ts_length)+'_comb_pred.png', bbox_inches='tight')
-                af_acc_label = new_base_acc_label
-                ba_label = new_base_ba_label
-                array_stack.append(output_array)
-                label_stack.append(output_label)
-            if len(array_stack)==0:
-                print('No enough TS')
-                continue
-            output_array_stacked = np.stack(array_stack, axis=0)
-            output_label_stacked = np.stack(label_stack, axis=0)
-            stack_over_location.append(output_array_stacked)
-            stack_label_over_locations.append(output_label_stacked)
-        dataset_stacked_over_locations = np.concatenate(stack_over_location, axis=0).transpose((0,2,1,3,4))
-        labels_stacked_over_locations = np.concatenate(stack_label_over_locations, axis=0)
-        del stack_over_location
-        del stack_label_over_locations
-        for i in range(n_channels):
-            print(np.nanmean(dataset_stacked_over_locations[:,i,:,:,:]))
-            print(np.nanstd(dataset_stacked_over_locations[:,i,:,:,:]))
-        np.save(save_path + '/' + file_name, dataset_stacked_over_locations.astype(np.float32))
-        np.save(save_path + '/' + label_name, labels_stacked_over_locations.astype(np.float32))
+                        ba_full = np.zeros(
+                            (original_shape_x, original_shape_y),
+                            dtype=bool,
+                        )
+
+                    print(
+                        os.path.basename(file_name),
+                        f"AF full={np.count_nonzero(af_full)}",
+                        f"AF crop={np.count_nonzero(af)}",
+                        f"BA full={np.count_nonzero(ba_full)}",
+                        f"BA crop={np.count_nonzero(ba)}",
+                    )
+
+                ba_label = np.logical_or(ba_label, ba)
+                af_acc_label = np.logical_or(af_acc_label, af)
+
+                if label_sel == 1:
+                    final_label = af_acc_label
+                else:
+                    final_label = np.logical_or(
+                        af_acc_label,
+                        ba_label,
+                    )
+
+                # Save state at the next stride boundary. Restoring this
+                # state after the window prevents overlapping windows from
+                # leaking future information into their early frames.
+                if j == interval - 1:
+                    new_base_acc_label = af_acc_label.copy()
+                    new_base_ba_label = ba_label.copy()
+                    new_base_max_img = max_img.copy()
+
+                if j < length:
+                    prev_final_label = final_label.copy()
+                    output_array[j] = img
+                else:
+                    new_mask = np.logical_and(
+                        np.logical_not(prev_final_label),
+                        final_label,
+                    )
+                    output_label[:] = new_mask.astype(np.float32)
+
+                    if debug:
+                        print(
+                            "previous accumulated:",
+                            np.count_nonzero(prev_final_label),
+                            "current accumulated:",
+                            np.count_nonzero(final_label),
+                            "new target:",
+                            np.count_nonzero(new_mask),
+                        )
+
+            af_acc_label = new_base_acc_label.copy()
+            ba_label = new_base_ba_label.copy()
+            max_img = new_base_max_img.copy()
+
+            array_stack.append(output_array)
+            label_stack.append(output_label)
+
+        if not array_stack:
+            print(f"{loc_name}: not enough time-series frames")
+            return None, None
+
+        loc_x = np.stack(array_stack, axis=0).transpose(
+            (0, 2, 1, 3, 4)
+        ).astype(np.float32)
+        loc_y = np.stack(label_stack, axis=0).astype(np.float32)
+
+        if not np.isfinite(loc_x).all():
+            raise ValueError(f"{loc_name}: processed inputs contain NaN/Inf")
+        if not np.isfinite(loc_y).all():
+            raise ValueError(f"{loc_name}: processed labels contain NaN/Inf")
+
+        positive_per_window = np.count_nonzero(
+            loc_y > 0,
+            axis=(1, 2),
+        )
+        print(
+            f"{loc_name}: {np.count_nonzero(positive_per_window)}/"
+            f"{len(positive_per_window)} windows contain positives; "
+            f"{positive_per_window.sum()} total positive pixels"
+        )
+        if positive_per_window.sum() == 0:
+            print(f"WARNING: {loc_name} has no positive prediction targets")
+
+        return loc_x, loc_y
 
 class AFTestDatasetProcessor(SatProcessingUtils):  
     def af_test_dataset_generator(self, location, file_name, save_path, image_size=(256, 256)):

@@ -35,11 +35,13 @@ if __name__ == '__main__':
     parser.add_argument('-ts', type=int, help='Length of TS')
     parser.add_argument('-it', type=int, help='Interval')
     parser.add_argument('-uc', type=str, help='use case')
+    parser.add_argument('--use_tessera_embeddings', action='store_true', help='Append static TESSERA embedding channels (128) to each fire sequence.')
     args = parser.parse_args()
     ts_length = args.ts
     interval = args.it
     modes = args.mode
     usecase=args.uc
+    use_tessera_embeddings = args.use_tessera_embeddings
     if modes == 'train':
         locations = train_ids
     elif modes == 'val':
@@ -59,7 +61,7 @@ if __name__ == '__main__':
                                                     file_name=usecase+'_'+modes+'_img_seqtoseq_alll_'+str(ts_length)+'i_'+str(interval)+'.npy',
                                                     label_name=usecase+'_'+modes+'_label_seqtoseq_alll_'+str(ts_length)+'i_'+str(interval)+'.npy',
                                                     save_path = 'dataset/dataset_'+modes, ts_length=ts_length, 
-                                                    interval=interval, image_size=(256, 256))
+                                                    interval=interval, image_size=(256, 256), use_tessera_embeddings=use_tessera_embeddings)
     else:  
         for id in locations:
             if usecase == 'ba':

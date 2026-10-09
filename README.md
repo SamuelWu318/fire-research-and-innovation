@@ -42,9 +42,11 @@ Prepare the Active fire detection dataset and Burned area mapping dataset:
 ```
 python dataset_gen_afba.py -mode (train/val/test) -ts (length of the time-series) -it (interval between each sampling) -uc (ba/af Active fire detection or burned area mapping)
 ```
-Prepare the Fire prediction prediction dataset:
+Prepare the Fire prediction prediction dataset (streams from/to Hugging Face; token from `--token` or `$HF_TOKEN`, see `notebooks/SwinUNETR_data_grab.ipynb` for Colab):
 ```
-python dataset_gen_pred.py -mode (train/val/test) -ts (length of the time-series) -it (interval between each sampling)
+python dataset_gen_pred.py process -mode (train val test) -ts (length of the time-series) -it (interval between each sampling)
+python dataset_gen_pred.py download --data-root ./data
+python run_spatial_temp_model_pred.py ... --data-root ./data
 ```
 
 ## Rerun the experiement
