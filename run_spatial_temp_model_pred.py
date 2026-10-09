@@ -10,7 +10,7 @@ import pandas as pd
 import torch
 import wandb
 from monai.data import decollate_batch
-from monai.losses.dice import DiceLoss
+from monai.losses.dice import DiceCELoss, DiceLoss
 from monai.metrics import DiceMetric, MeanIoU
 from monai.transforms import Activations, AsDiscrete, Compose
 from sklearn.metrics import f1_score, jaccard_score
@@ -31,6 +31,9 @@ from spatial_models.unetr.unetr import UNETR
 
 
 SEED = 42
+# TS-SatFire paper, prediction task: "a 1:1 mixture of Dice and CE loss with a
+# learning rate of 0.001", CE weight parameter [1.0, 446.7836].
+PAPER_CE_WEIGHT = (1.0, 446.7836)
 # 27 stored channels become 43 after the 17-class land-cover one-hot.
 BASE_MODEL_CHANNELS = 43
 
@@ -48,6 +51,7 @@ def configure_wandb(
     run_test,
     use_tessera,
     model_input_channels,
+    loss_config,
 ):
     """Initialize one W&B run for either training or testing."""
     wandb.login()
@@ -56,6 +60,7 @@ def configure_wandb(
         f"{'test' if run_test else 'train'}_{mode}_{model_name}_"
         f"num_heads_{num_heads}_hidden_size_{hidden_size}_"
         f"batchsize_{batch_size}{'_tessera' if use_tessera else ''}"
+        f"{'' if loss_config['loss'] == 'dice' else '_' + loss_config['loss']}"
     )
     wandb.config.update(
         {
@@ -67,6 +72,7 @@ def configure_wandb(
             "model": model_name,
             "tessera": use_tessera,
             "input_channels": model_input_channels,
+            **loss_config,
         }
     )
 
@@ -256,6 +262,40 @@ def upload_checkpoint(save_path, epoch, val_loss, artifact_name, extra=None):
     print(f"Checkpoint logged to W&B Artifacts: {artifact_name}")
 
 
+def build_criterion(loss_name, ce_weight=PAPER_CE_WEIGHT, lambda_dice=1.0, lambda_ce=1.0):
+    """Training loss for 2-channel (background, fire) logits.
+
+    dice:   sigmoid Dice loss, as in the released TS-SatFire code.
+    dicece: the paper's prediction loss, MONAI DiceCELoss with `lambda_dice`
+            Dice + `lambda_ce` cross entropy (1:1 by default). MONAI applies
+            the `weight` parameter to both terms: per-class Dice weights and
+            CrossEntropyLoss class weights (the one-hot target is used as class
+            probabilities), the same in MONAI 1.3.2 and later.
+    """
+    if loss_name == "dice":
+        return DiceLoss(include_background=True, reduction="mean", sigmoid=True)
+    if loss_name == "dicece":
+        return DiceCELoss(
+            include_background=True,
+            sigmoid=True,
+            reduction="mean",
+            weight=torch.tensor(ce_weight, dtype=torch.float32),
+            lambda_dice=lambda_dice,
+            lambda_ce=lambda_ce,
+        )
+    raise ValueError(f"Unsupported loss: {loss_name}")
+
+
+def compute_loss(criterion, outputs, labels):
+    """Return (loss, {component name: value}) so components can be logged."""
+    if isinstance(criterion, DiceCELoss):
+        dice = criterion.dice(outputs, labels)
+        ce = criterion.ce(outputs, labels)
+        loss = criterion.lambda_dice * dice + criterion.lambda_ce * ce
+        return loss, {"dice_loss": dice.detach(), "ce_loss": ce.detach()}
+    return criterion(outputs, labels), {}
+
+
 def train_model(
     model,
     model_name,
@@ -283,6 +323,7 @@ def train_model(
     for epoch in range(max_epochs):
         model.train()
         train_loss = 0.0
+        train_components = {}
         train_bar = tqdm(
             train_dataloader,
             total=len(train_dataloader),
@@ -303,13 +344,18 @@ def train_model(
                 data_batch,
                 device,
             )
-            loss = criterion(outputs, labels_batch)
+            loss, components = compute_loss(criterion, outputs, labels_batch)
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
 
             train_loss += loss.detach().item() * data_batch.size(0)
+            for name, value in components.items():
+                train_components[name] = (
+                    train_components.get(name, 0.0)
+                    + value.item() * data_batch.size(0)
+                )
             running_loss = train_loss / (
                 (batch_idx + 1) * data_batch.size(0)
             )
@@ -321,11 +367,19 @@ def train_model(
                 )
 
         train_loss /= len(train_dataset)
-        wandb.log({"epoch": epoch, "train_loss": train_loss})
-        print(f"Epoch {epoch + 1}, Train Loss: {train_loss:.4f}")
+        train_components = {
+            f"train_{name}": total / len(train_dataset)
+            for name, total in train_components.items()
+        }
+        wandb.log({"epoch": epoch, "train_loss": train_loss, **train_components})
+        print(
+            f"Epoch {epoch + 1}, Train Loss: {train_loss:.4f}"
+            + "".join(f", {k}: {v:.4f}" for k, v in train_components.items())
+        )
 
         model.eval()
         val_loss = 0.0
+        val_components = {}
         iou_values = []
         dice_values = []
         val_bar = tqdm(
@@ -351,8 +405,13 @@ def train_model(
                     data_batch,
                     device,
                 )
-                loss = criterion(outputs, labels_batch)
+                loss, components = compute_loss(criterion, outputs, labels_batch)
                 val_loss += loss.detach().item() * data_batch.size(0)
+                for name, value in components.items():
+                    val_components[name] = (
+                        val_components.get(name, 0.0)
+                        + value.item() * data_batch.size(0)
+                    )
 
                 discrete_outputs = [
                     post_trans(item)
@@ -379,6 +438,10 @@ def train_model(
                 val_bar.set_postfix(loss=f"{running_val_loss:.4f}")
 
         val_loss /= len(val_dataset)
+        val_components = {
+            f"val_{name}": total / len(val_dataset)
+            for name, total in val_components.items()
+        }
         mean_iou_val = float(np.mean(iou_values))
         mean_dice_val = float(np.mean(dice_values))
 
@@ -387,11 +450,13 @@ def train_model(
                 "val_loss": val_loss,
                 "miou": mean_iou_val,
                 "mdice": mean_dice_val,
+                **val_components,
             }
         )
         print(
             f"Epoch {epoch + 1}, Validation Loss: {val_loss:.4f}, "
-            f"Mean IoU: {mean_iou_val:.4f}, "
+            + "".join(f"{k}: {v:.4f}, " for k, v in val_components.items())
+            + f"Mean IoU: {mean_iou_val:.4f}, "
             f"Mean Dice: {mean_dice_val:.4f}"
         )
 
@@ -692,6 +757,23 @@ def parse_args():
         help="Folder of tessera/p<id>.npz files; default <data-root>/tessera",
     )
     parser.add_argument(
+        "--loss",
+        choices=("dice", "dicece"),
+        default="dice",
+        help="dice: released TS-SatFire code. dicece: the paper's prediction "
+        "loss, 1:1 Dice + CE with --ce-weight (use with -lr 0.001)",
+    )
+    parser.add_argument(
+        "--ce-weight",
+        type=float,
+        nargs=2,
+        default=list(PAPER_CE_WEIGHT),
+        metavar=("BACKGROUND", "FIRE"),
+        help="dicece class weights (default: the paper's 1.0 446.7836)",
+    )
+    parser.add_argument("--lambda-dice", type=float, default=1.0)
+    parser.add_argument("--lambda-ce", type=float, default=1.0)
+    parser.add_argument(
         "--upload-checkpoints",
         action="store_true",
         help="Also store each best checkpoint as a versioned W&B model Artifact",
@@ -758,6 +840,15 @@ def main():
             else processed_data_root / "tessera"
         )
     tessera_tag = "_tessera" if use_tessera else ""
+    loss_config = {"loss": args.loss}
+    if args.loss == "dicece":
+        loss_config.update(
+            ce_weight=list(args.ce_weight),
+            lambda_dice=args.lambda_dice,
+            lambda_ce=args.lambda_ce,
+        )
+    # Name tag for checkpoints; the released-code Dice loss keeps the old names.
+    run_tag = tessera_tag + ("" if args.loss == "dice" else f"_{args.loss}")
 
     configure_wandb(
         model_name=model_name,
@@ -772,6 +863,7 @@ def main():
         run_test=args.run_test,
         use_tessera=use_tessera,
         model_input_channels=model_input_channels,
+        loss_config=loss_config,
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -789,11 +881,12 @@ def main():
     model = nn.DataParallel(model)
     model.to(device)
 
-    criterion = DiceLoss(
-        include_background=True,
-        reduction="mean",
-        sigmoid=True,
-    )
+    criterion = build_criterion(
+        args.loss,
+        ce_weight=args.ce_weight,
+        lambda_dice=args.lambda_dice,
+        lambda_ce=args.lambda_ce,
+    ).to(device)
     mean_iou = MeanIoU(
         include_background=True,
         reduction="mean",
@@ -863,7 +956,7 @@ def main():
             f"model_{model_name}_mode_{mode}_num_heads_{num_heads}_"
             f"hidden_size_{hidden_size}_batchsize_{batch_size}_"
             "checkpoint_epoch_{epoch}_"
-            f"nc_{model_input_channels}_ts_{ts_length}{tessera_tag}.pth"
+            f"nc_{model_input_channels}_ts_{ts_length}{run_tag}.pth"
         )
         train_model(
             model=model,
@@ -886,9 +979,10 @@ def main():
                 "use_tessera": use_tessera,
                 "model_input_channels": model_input_channels,
                 "tessera_stats": tessera_stats,
+                "loss_config": loss_config,
             },
             artifact_name=(
-                f"{model_name}{tessera_tag.replace('_', '-')}-checkpoints-{wandb.run.id}"
+                f"{model_name}{run_tag.replace('_', '-')}-checkpoints-{wandb.run.id}"
                 if args.upload_checkpoints
                 else None
             ),
@@ -903,7 +997,7 @@ def main():
                 f"model_{model_name}_mode_{mode}_num_heads_{num_heads}_"
                 f"hidden_size_{hidden_size}_batchsize_{batch_size}_"
                 f"checkpoint_epoch_{args.load_epoch}_"
-                f"nc_{model_input_channels}_ts_{ts_length}{tessera_tag}.pth"
+                f"nc_{model_input_channels}_ts_{ts_length}{run_tag}.pth"
             )
         )
 
