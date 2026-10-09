@@ -19,7 +19,11 @@ from torch.cuda.amp import GradScaler
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
-from satimg_dataset_processor.data_generator_pred_torch import FireDataset
+from satimg_dataset_processor.data_generator_pred_torch import (
+    TESSERA_CHANNELS,
+    FireDataset,
+    compute_tessera_stats,
+)
 from spatial_models.attentionunet import AttentionUnet
 from spatial_models.swinunetr.swinunetr import SwinUNETR
 from spatial_models.unet import UNet
@@ -27,6 +31,8 @@ from spatial_models.unetr.unetr import UNETR
 
 
 SEED = 42
+# 27 stored channels become 43 after the 17-class land-cover one-hot.
+BASE_MODEL_CHANNELS = 43
 
 
 def configure_wandb(
@@ -40,6 +46,8 @@ def configure_wandb(
     max_epochs,
     wandb_user_name,
     run_test,
+    use_tessera,
+    model_input_channels,
 ):
     """Initialize one W&B run for either training or testing."""
     wandb.login()
@@ -47,7 +55,7 @@ def configure_wandb(
     wandb.run.name = (
         f"{'test' if run_test else 'train'}_{mode}_{model_name}_"
         f"num_heads_{num_heads}_hidden_size_{hidden_size}_"
-        f"batchsize_{batch_size}"
+        f"batchsize_{batch_size}{'_tessera' if use_tessera else ''}"
     )
     wandb.config.update(
         {
@@ -57,6 +65,8 @@ def configure_wandb(
             "batch_size": batch_size,
             "mode": mode,
             "model": model_name,
+            "tessera": use_tessera,
+            "input_channels": model_input_channels,
         }
     )
 
@@ -99,8 +109,9 @@ def validate_dataset_output(dataset, expected_model_channels, dataset_name):
         raise ValueError(
             f"{dataset_name} FireDataset produces {actual_channels} channels "
             f"after preprocessing, but the model is configured for "
-            f"{expected_model_channels}. The current 27-channel archive plus "
-            "17-class land-cover expansion should produce 43 channels."
+            f"{expected_model_channels}. The 27-channel archive plus 17-class "
+            f"land-cover expansion gives {BASE_MODEL_CHANNELS} channels; "
+            f"--tessera adds {TESSERA_CHANNELS} more."
         )
 
     print(
@@ -203,6 +214,8 @@ def save_checkpoint(
     epoch,
     val_loss,
     save_path,
+    extra=None,
+    artifact_name=None,
 ):
     torch.save(
         {
@@ -210,9 +223,37 @@ def save_checkpoint(
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "loss": val_loss,
+            # Run config (e.g. TESSERA mode and its normalization) needed to
+            # rebuild identical inputs at test time.
+            **(extra or {}),
         },
         save_path,
     )
+
+    if artifact_name is not None:
+        upload_checkpoint(save_path, epoch, val_loss, artifact_name, extra)
+
+
+def upload_checkpoint(save_path, epoch, val_loss, artifact_name, extra=None):
+    """Store a versioned checkpoint as a W&B model Artifact.
+
+    Online, wait for the upload so a later best checkpoint cannot replace the
+    file first; offline runs log it locally for a later `wandb sync`.
+    """
+    if wandb.run is None:
+        raise RuntimeError("A W&B run is required to upload model checkpoints")
+    metadata = {"epoch": epoch + 1, "validation_loss": float(val_loss)}
+    for key in ("use_tessera", "model_input_channels"):
+        if extra and key in extra:
+            metadata[key] = extra[key]
+    artifact = wandb.Artifact(name=artifact_name, type="model", metadata=metadata)
+    artifact.add_file(str(save_path), name=Path(save_path).name)
+    uploaded = wandb.run.log_artifact(
+        artifact, aliases=["best", "latest", f"epoch-{epoch + 1}"]
+    )
+    if not wandb.run.offline:
+        uploaded.wait()
+    print(f"Checkpoint logged to W&B Artifacts: {artifact_name}")
 
 
 def train_model(
@@ -232,6 +273,8 @@ def train_model(
     max_epochs,
     top_n_checkpoints,
     checkpoint_name,
+    checkpoint_extra=None,
+    artifact_name=None,
 ):
     """Train and validate while retaining the best validation checkpoints."""
     # Store (-loss, path), making heap[0] the worst retained checkpoint.
@@ -364,6 +407,8 @@ def train_model(
                 epoch,
                 val_loss,
                 checkpoint_path,
+                checkpoint_extra,
+                artifact_name,
             )
             heapq.heappush(
                 best_checkpoints,
@@ -384,6 +429,8 @@ def train_model(
                     epoch,
                     val_loss,
                     checkpoint_path,
+                    checkpoint_extra,
+                    artifact_name,
                 )
 
     print("Best checkpoints:")
@@ -593,8 +640,9 @@ def parse_args():
     parser.add_argument(
         "-nc",
         type=int,
-        required=True,
-        help="Model input channels after preprocessing; currently 43",
+        default=None,
+        help="Model input channels after preprocessing: 43, or 172 with "
+        "--tessera. Derived when omitted; checked when given.",
     )
     parser.add_argument("-ts", type=int, required=True, help="Time-series length")
     parser.add_argument(
@@ -633,6 +681,27 @@ def parse_args():
         default="~/CalFireMonitoring/roi/us_fire_2021_out_new.csv",
     )
     parser.add_argument("--plot-dir", default="evaluation_plot")
+    parser.add_argument(
+        "--tessera",
+        action="store_true",
+        help="Append per-fire TESSERA embeddings (128 bands + validity mask)",
+    )
+    parser.add_argument(
+        "--tessera-dir",
+        default=None,
+        help="Folder of tessera/p<id>.npz files; default <data-root>/tessera",
+    )
+    parser.add_argument(
+        "--upload-checkpoints",
+        action="store_true",
+        help="Also store each best checkpoint as a versioned W&B model Artifact",
+    )
+    parser.add_argument(
+        "--tessera-min-coverage",
+        type=float,
+        default=0.5,
+        help="TESSERA pixels below this coverage are zeroed and masked",
+    )
     parser.add_argument("--wandb-user", default="gt-fri")
     return parser.parse_args()
 
@@ -659,12 +728,17 @@ def main():
 
     # The NPZ members contain 27 channels. FireDataset then replaces the
     # land-cover channel with 17 one-hot channels, producing 43 model channels.
+    # TESSERA mode appends 128 embedding bands and one validity mask.
     stored_n_channels = 27
-    model_input_channels = args.nc
-    if model_input_channels != 43:
+    use_tessera = args.tessera
+    model_input_channels = BASE_MODEL_CHANNELS + (
+        TESSERA_CHANNELS if use_tessera else 0
+    )
+    if args.nc is not None and args.nc != model_input_channels:
         raise ValueError(
-            f"-nc must be 43 with the current FireDataset preprocessing; "
-            f"received {model_input_channels}"
+            f"-nc {args.nc} does not match the preprocessing: expected "
+            f"{model_input_channels} {'with' if use_tessera else 'without'} "
+            "--tessera"
         )
 
     root_dir = Path("/content/data")
@@ -676,6 +750,14 @@ def main():
     train_npz_dir = processed_data_root / "train"
     val_npz_dir = processed_data_root / "val"
     test_npz_dir = processed_data_root / "test"
+    tessera_dir = None
+    if use_tessera:
+        tessera_dir = (
+            Path(args.tessera_dir).expanduser()
+            if args.tessera_dir is not None
+            else processed_data_root / "tessera"
+        )
+    tessera_tag = "_tessera" if use_tessera else ""
 
     configure_wandb(
         model_name=model_name,
@@ -688,6 +770,8 @@ def main():
         max_epochs=max_epochs,
         wandb_user_name=args.wandb_user,
         run_test=args.run_test,
+        use_tessera=use_tessera,
+        model_input_channels=model_input_channels,
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -727,12 +811,21 @@ def main():
     scaler = GradScaler(enabled=device.type == "cuda")
 
     if not args.run_test:
+        tessera_stats = None
+        if use_tessera:
+            # Normalization comes from the training fires only.
+            tessera_stats = compute_tessera_stats(
+                [tessera_dir / path.name for path in sorted(train_npz_dir.glob("*.npz"))],
+                min_coverage=args.tessera_min_coverage,
+            )
         train_dataset = FireDataset(
             npz_dir=train_npz_dir,
             ts_length=ts_length,
             n_channel=stored_n_channels,
             target_is_single_day=True,
             use_augmentations=True,
+            tessera_dir=tessera_dir,
+            tessera_stats=tessera_stats,
         )
         val_dataset = FireDataset(
             npz_dir=val_npz_dir,
@@ -740,6 +833,8 @@ def main():
             n_channel=stored_n_channels,
             target_is_single_day=True,
             use_augmentations=False,
+            tessera_dir=tessera_dir,
+            tessera_stats=tessera_stats,
         )
 
         # Use validation for the shape check so random augmentation is avoided.
@@ -768,7 +863,7 @@ def main():
             f"model_{model_name}_mode_{mode}_num_heads_{num_heads}_"
             f"hidden_size_{hidden_size}_batchsize_{batch_size}_"
             "checkpoint_epoch_{epoch}_"
-            f"nc_{model_input_channels}_ts_{ts_length}.pth"
+            f"nc_{model_input_channels}_ts_{ts_length}{tessera_tag}.pth"
         )
         train_model(
             model=model,
@@ -787,21 +882,18 @@ def main():
             max_epochs=max_epochs,
             top_n_checkpoints=top_n_checkpoints,
             checkpoint_name=checkpoint_name,
+            checkpoint_extra={
+                "use_tessera": use_tessera,
+                "model_input_channels": model_input_channels,
+                "tessera_stats": tessera_stats,
+            },
+            artifact_name=(
+                f"{model_name}{tessera_tag.replace('_', '-')}-checkpoints-{wandb.run.id}"
+                if args.upload_checkpoints
+                else None
+            ),
         )
         return
-
-    test_dataset = FireDataset(
-        npz_dir=test_npz_dir,
-        ts_length=ts_length,
-        n_channel=stored_n_channels,
-        target_is_single_day=True,
-        use_augmentations=False,
-    )
-    validate_dataset_output(
-        test_dataset,
-        model_input_channels,
-        "test",
-    )
 
     checkpoint_path = args.checkpoint
     if checkpoint_path is None:
@@ -811,14 +903,40 @@ def main():
                 f"model_{model_name}_mode_{mode}_num_heads_{num_heads}_"
                 f"hidden_size_{hidden_size}_batchsize_{batch_size}_"
                 f"checkpoint_epoch_{args.load_epoch}_"
-                f"nc_{model_input_channels}_ts_{ts_length}.pth"
+                f"nc_{model_input_channels}_ts_{ts_length}{tessera_tag}.pth"
             )
         )
 
+    # weights_only=False: the checkpoint also stores the TESSERA statistics.
     checkpoint = torch.load(
         checkpoint_path,
         map_location=device,
+        weights_only=False,
     )
+    # Checkpoints from before TESSERA support carry no flag: they are 43-channel.
+    trained_with_tessera = bool(checkpoint.get("use_tessera", False))
+    if trained_with_tessera != use_tessera:
+        raise ValueError(
+            f"{checkpoint_path} was trained "
+            f"{'with' if trained_with_tessera else 'without'} TESSERA; "
+            f"{'add' if trained_with_tessera else 'remove'} --tessera"
+        )
+
+    test_dataset = FireDataset(
+        npz_dir=test_npz_dir,
+        ts_length=ts_length,
+        n_channel=stored_n_channels,
+        target_is_single_day=True,
+        use_augmentations=False,
+        tessera_dir=tessera_dir,
+        tessera_stats=checkpoint.get("tessera_stats"),
+    )
+    validate_dataset_output(
+        test_dataset,
+        model_input_channels,
+        "test",
+    )
+
     model.load_state_dict(checkpoint["model_state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     print(
@@ -845,3 +963,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    wandb.finish()
