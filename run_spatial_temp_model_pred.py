@@ -13,7 +13,7 @@ from monai.data import decollate_batch
 from monai.losses.dice import DiceCELoss, DiceLoss
 from monai.metrics import DiceMetric, MeanIoU
 from monai.transforms import Activations, AsDiscrete, Compose
-from sklearn.metrics import f1_score, jaccard_score
+from sklearn.metrics import jaccard_score
 from torch import nn, optim
 from torch.cuda.amp import GradScaler
 from torch.utils.data import DataLoader, Subset
@@ -38,6 +38,34 @@ PAPER_CE_WEIGHT = (1.0, 446.7836)
 BASE_MODEL_CHANNELS = 43
 
 
+def build_wandb_metric_labels(loss_name):
+    """Describe the task, loss, and classes included in each graph."""
+    loss_title = {
+        "dice": "Dice Loss",
+        "dicece": "Weighted Dice + Cross-Entropy Loss",
+    }[loss_name]
+    labels = {
+        "epoch": "Training Epoch (Starting at 0)",
+        "train_loss": f"Training {loss_title} — Next-Day Fire Growth",
+        "val_loss": f"Validation {loss_title} — Next-Day Fire Growth",
+        "miou": "Validation Mean IoU — Background & Fire Growth",
+        "mdice": "Validation Mean Dice (F1) — Background & Fire Growth",
+        "train_fire_f1": "Training F1 — Next-Day Fire Growth",
+        "train_background_f1": "Training F1 — Background",
+        "val_fire_f1": "Validation F1 — Next-Day Fire Growth",
+        "val_background_f1": "Validation F1 — Background",
+    }
+    if loss_name == "dicece":
+        for prefix, split in (("train", "Training"), ("val", "Validation")):
+            labels[f"{prefix}_dice_loss"] = (
+                f"{split} Weighted Dice Loss — Next-Day Fire Growth"
+            )
+            labels[f"{prefix}_ce_loss"] = (
+                f"{split} Weighted Cross-Entropy Loss — Next-Day Fire Growth"
+            )
+    return labels
+
+
 def configure_wandb(
     model_name,
     mode,
@@ -56,6 +84,13 @@ def configure_wandb(
     """Initialize one W&B run for either training or testing."""
     wandb.login()
     wandb.init(project="AFBAPred", entity=wandb_user_name)
+    if not run_test:
+        metric_labels = build_wandb_metric_labels(loss_config["loss"])
+        epoch_metric = metric_labels["epoch"]
+        wandb.define_metric(epoch_metric)
+        for key, label in metric_labels.items():
+            if key != "epoch":
+                wandb.define_metric(label, step_metric=epoch_metric)
     wandb.run.name = (
         f"{'test' if run_test else 'train'}_{mode}_{model_name}_"
         f"num_heads_{num_heads}_hidden_size_{hidden_size}_"
@@ -296,6 +331,33 @@ def compute_loss(criterion, outputs, labels):
     return criterion(outputs, labels), {}
 
 
+def _channel_f1(predictions, labels, channel):
+    """Return per-sample F1 for one channel of binary (B,2,H,W) masks.
+
+    Empty prediction and empty target score 1, matching existing test F1
+    and DiceMetric(ignore_empty=False). Channels are evaluated independently.
+    """
+    predicted = predictions[:, channel].bool().flatten(start_dim=1)
+    target = (labels[:, channel] > 0).flatten(start_dim=1)
+    true_positive = (predicted & target).sum(dim=1).float()
+    denominator = predicted.sum(dim=1).float() + target.sum(dim=1).float()
+    return torch.where(
+        denominator > 0,
+        2.0 * true_positive / denominator.clamp_min(1.0),
+        torch.ones_like(denominator),
+    )
+
+
+def fire_only_f1(predictions, labels):
+    """Per-sample next-day fire-growth F1 from thresholded channel 1."""
+    return _channel_f1(predictions, labels, channel=1)
+
+
+def background_f1(predictions, labels):
+    """Per-sample background F1 from thresholded channel 0."""
+    return _channel_f1(predictions, labels, channel=0)
+
+
 def train_model(
     model,
     model_name,
@@ -317,6 +379,9 @@ def train_model(
     artifact_name=None,
 ):
     """Train and validate while retaining the best validation checkpoints."""
+    metric_labels = build_wandb_metric_labels(
+        "dicece" if isinstance(criterion, DiceCELoss) else "dice"
+    )
     # Store (-loss, path), making heap[0] the worst retained checkpoint.
     best_checkpoints = []
 
@@ -324,6 +389,8 @@ def train_model(
         model.train()
         train_loss = 0.0
         train_components = {}
+        train_fire_f1_sum = 0.0
+        train_background_f1_sum = 0.0
         train_bar = tqdm(
             train_dataloader,
             total=len(train_dataloader),
@@ -345,6 +412,13 @@ def train_model(
                 device,
             )
             loss, components = compute_loss(criterion, outputs, labels_batch)
+
+            with torch.no_grad():
+                predictions = torch.stack(
+                    [post_trans(item) for item in decollate_batch(outputs.detach())]
+                )
+                train_fire_f1_sum += fire_only_f1(predictions, labels_batch).sum().item()
+                train_background_f1_sum += background_f1(predictions, labels_batch).sum().item()
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -371,7 +445,15 @@ def train_model(
             f"train_{name}": total / len(train_dataset)
             for name, total in train_components.items()
         }
-        wandb.log({"epoch": epoch, "train_loss": train_loss, **train_components})
+        wandb.log(
+            {
+                metric_labels["epoch"]: epoch,
+                metric_labels["train_loss"]: train_loss,
+                metric_labels["train_fire_f1"]: train_fire_f1_sum / len(train_dataset),
+                metric_labels["train_background_f1"]: train_background_f1_sum / len(train_dataset),
+                **{metric_labels[name]: value for name, value in train_components.items()},
+            }
+        )
         print(
             f"Epoch {epoch + 1}, Train Loss: {train_loss:.4f}"
             + "".join(f", {k}: {v:.4f}" for k, v in train_components.items())
@@ -382,6 +464,8 @@ def train_model(
         val_components = {}
         iou_values = []
         dice_values = []
+        val_fire_f1_sum = 0.0
+        val_background_f1_sum = 0.0
         val_bar = tqdm(
             val_dataloader,
             total=len(val_dataloader),
@@ -418,6 +502,9 @@ def train_model(
                     for item in decollate_batch(outputs)
                 ]
                 discrete_labels = decollate_batch(labels_batch)
+                predictions = torch.stack(discrete_outputs)
+                val_fire_f1_sum += fire_only_f1(predictions, labels_batch).sum().item()
+                val_background_f1_sum += background_f1(predictions, labels_batch).sum().item()
 
                 iou_values.append(
                     mean_iou(
@@ -444,20 +531,26 @@ def train_model(
         }
         mean_iou_val = float(np.mean(iou_values))
         mean_dice_val = float(np.mean(dice_values))
+        val_fire_f1 = val_fire_f1_sum / len(val_dataset)
+        val_background_f1 = val_background_f1_sum / len(val_dataset)
 
         wandb.log(
             {
-                "val_loss": val_loss,
-                "miou": mean_iou_val,
-                "mdice": mean_dice_val,
-                **val_components,
+                metric_labels["epoch"]: epoch,
+                metric_labels["val_loss"]: val_loss,
+                metric_labels["miou"]: mean_iou_val,
+                metric_labels["mdice"]: mean_dice_val,
+                metric_labels["val_fire_f1"]: val_fire_f1,
+                metric_labels["val_background_f1"]: val_background_f1,
+                **{metric_labels[name]: value for name, value in val_components.items()},
             }
         )
         print(
             f"Epoch {epoch + 1}, Validation Loss: {val_loss:.4f}, "
             + "".join(f"{k}: {v:.4f}, " for k, v in val_components.items())
             + f"Mean IoU: {mean_iou_val:.4f}, "
-            f"Mean Dice: {mean_dice_val:.4f}"
+            f"Mean Dice: {mean_dice_val:.4f}, "
+            f"Fire F1: {val_fire_f1:.4f}, Background F1: {val_background_f1:.4f}"
         )
 
         checkpoint_path = os.path.join(
@@ -561,6 +654,7 @@ def evaluate_model(
 
     model.eval()
     f1_all = 0.0
+    background_f1_all = 0.0
     iou_all = 0.0
     evaluated_fire_count = 0
 
@@ -575,6 +669,7 @@ def evaluate_model(
         )
 
         fire_f1 = 0.0
+        fire_background_f1 = 0.0
         fire_iou = 0.0
         window_count = 0
 
@@ -594,7 +689,10 @@ def evaluate_model(
                     for item in decollate_batch(outputs)
                 ]
 
-            outputs_numpy = torch.stack(discrete_outputs).cpu().numpy()
+            predictions = torch.stack(discrete_outputs).cpu()
+            fire_f1 += fire_only_f1(predictions, labels_batch).sum().item()
+            fire_background_f1 += background_f1(predictions, labels_batch).sum().item()
+            outputs_numpy = predictions.numpy()
             window_count += data_batch.shape[0]
 
             for sample_idx in range(data_batch.shape[0]):
@@ -603,11 +701,6 @@ def evaluate_model(
                     labels_batch[sample_idx, 1] > 0
                 ).cpu().numpy()
 
-                fire_f1 += f1_score(
-                    label.flatten(),
-                    prediction.flatten(),
-                    zero_division=1.0,
-                )
                 fire_iou += jaccard_score(
                     label.flatten(),
                     prediction.flatten(),
@@ -676,19 +769,32 @@ def evaluate_model(
         mean_fire_f1 = fire_f1 / window_count
         mean_fire_iou = fire_iou / window_count
         f1_all += mean_fire_f1
+        background_f1_all += fire_background_f1 / window_count
         iou_all += mean_fire_iou
         evaluated_fire_count += 1
 
         print(f"ID {fire_id} IoU: {mean_fire_iou}")
         print(f"ID {fire_id} F1: {mean_fire_f1}")
+        print(f"ID {fire_id} Background F1: {fire_background_f1 / window_count}")
 
     if evaluated_fire_count == 0:
         raise RuntimeError("No test fires were evaluated")
 
     model_f1 = f1_all / evaluated_fire_count
     model_iou = iou_all / evaluated_fire_count
-    print(f"Model F1: {model_f1}; model IoU: {model_iou}")
-    wandb.log({"test_f1": model_f1, "test_iou": model_iou})
+    model_background_f1 = background_f1_all / evaluated_fire_count
+    print(
+        f"Model F1: {model_f1}; background F1: {model_background_f1}; "
+        f"model IoU: {model_iou}"
+    )
+    wandb.log(
+        {
+            "test_f1": model_f1,
+            "test_iou": model_iou,
+            "Test F1 — Next-Day Fire Growth": model_f1,
+            "Test F1 — Background": model_background_f1,
+        }
+    )
 
 
 def parse_args():
