@@ -139,13 +139,14 @@ def validate_dataset_output(dataset, expected_model_channels, dataset_name):
     sample = dataset[0]
     data_shape = tuple(sample["data"].shape)
     label_shape = tuple(sample["labels"].shape)
+    static_channels = sample["static"].shape[0] if "static" in sample else 0
 
     if len(data_shape) != 4:
         raise ValueError(
             f"{dataset_name} sample must be (C,T,H,W), found {data_shape}"
         )
 
-    actual_channels = data_shape[0]
+    actual_channels = data_shape[0] + static_channels
     if actual_channels != expected_model_channels:
         raise ValueError(
             f"{dataset_name} FireDataset produces {actual_channels} channels "
@@ -158,6 +159,7 @@ def validate_dataset_output(dataset, expected_model_channels, dataset_name):
     print(
         f"{dataset_name} windows={len(dataset)}, "
         f"data shape={data_shape}, label shape={label_shape}"
+        + (f", static TESSERA channels={static_channels}" if static_channels else "")
     )
 
 
@@ -244,6 +246,22 @@ def build_model(
         )
 
     raise NotImplementedError(f"Unsupported model: {model_name}")
+
+
+def batch_inputs(batch, device):
+    """Model input on `device`: the 43 stored channels, then (TESSERA mode)
+    the static (129, H, W) map repeated across the T days.
+
+    The repeat happens here on the GPU, not in the loader, so host RAM holds
+    the TESSERA map once per sample instead of once per day. The channel
+    order matches appending TESSERA after the base channels.
+    """
+    data = batch["data"].to(device, non_blocking=True)
+    if "static" in batch:
+        static = batch["static"].to(device, non_blocking=True)
+        static = static.unsqueeze(2).expand(-1, -1, data.shape[2], -1, -1)
+        data = torch.cat((data, static), dim=1)
+    return data
 
 
 def forward_model(model, model_name, data_batch, device):
@@ -406,7 +424,7 @@ def train_model(
         )
 
         for batch_idx, batch in enumerate(train_bar):
-            data_batch = batch["data"].to(device, non_blocking=True)
+            data_batch = batch_inputs(batch, device)
             labels_batch = batch["labels"].float().to(
                 device,
                 non_blocking=True,
@@ -482,10 +500,7 @@ def train_model(
 
         with torch.no_grad():
             for batch_idx, batch in enumerate(val_bar):
-                data_batch = batch["data"].to(
-                    device,
-                    non_blocking=True,
-                )
+                data_batch = batch_inputs(batch, device)
                 labels_batch = batch["labels"].float().to(
                     device,
                     non_blocking=True,
@@ -691,7 +706,7 @@ def evaluate_model(
                 outputs = forward_model(
                     model,
                     model_name,
-                    data_batch.to(device, non_blocking=True),
+                    batch_inputs(batch, device),
                     device,
                 )
                 discrete_outputs = [
@@ -1004,7 +1019,9 @@ def main():
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    pin_memory = device.type == "cuda"
+    # No pinned host copies: with TESSERA a batch of 8 is about 0.8 GiB, and
+    # pinning keeps a second copy of each in host RAM.
+    pin_memory = False
 
     model = build_model(
         model_name=model_name,

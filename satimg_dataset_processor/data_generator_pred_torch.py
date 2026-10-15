@@ -103,6 +103,10 @@ class FireDataset(Dataset):
 
     Because each window is a separate ZIP member, __getitem__ decompresses
     only the requested data/label pair rather than the entire fire.
+
+    Each item is {"data": (43, T, H, W), "labels": (2, H, W)}, plus
+    "static": (129, H, W) in TESSERA mode. The trainer repeats "static" across
+    the T days on the GPU and appends it after the 43 channels.
     """
 
     def __init__(
@@ -287,24 +291,27 @@ class FireDataset(Dataset):
         # - OLD: channels are excluded from this normalization operation.
         x = self.normalizer(x)
 
-        # * NEW: append the fire's TESSERA channels after the 27 stored ones,
-        # * NEW: before augmentation so they flip and rotate with the image.
-        # * NEW: Appending keeps the degree and land-cover indices unchanged.
-        if self.tessera_dir is not None:
-            x = torch.cat((x, self.load_tessera(idx, x.shape[1])), dim=0)
+        # * NEW: the fire's TESSERA map is static, so it is returned once as
+        # * NEW: (129, H, W). Repeating it across the T days here cost T times
+        # * NEW: its size in host RAM; the trainer repeats it on the GPU.
+        static = self.load_tessera(idx) if self.tessera_dir is not None else None
 
         # - OLD: augment training examples but leave validation unchanged.
+        # * NEW: the TESSERA map gets the same flips and rotation.
         if self.use_augmentations:
-            x, y = self.augment(x, y)
+            x, y, static = self.augment(x, y, static)
 
         # - OLD: convert degrees to sine values and one-hot encode land cover.
         x = self.preprocess(x)
 
         # - OLD: retain the dictionary interface used by the training loop.
-        return {
+        sample = {
             "data": x,
             "labels": y,
         }
+        if static is not None:
+            sample["static"] = static
+        return sample
 
     def load_data(self, idx):
         """Load and decode exactly one temporal window.
@@ -395,12 +402,11 @@ class FireDataset(Dataset):
 
         return x, y
 
-    def load_tessera(self, idx, ts_length):
-        """Return (129, T, H, W): normalized embedding plus validity mask.
+    def load_tessera(self, idx):
+        """Return (129, H, W): normalized embedding plus validity mask.
 
         Pixels whose TESSERA coverage is below the training threshold are
-        zeroed (the normalized mean) and marked 0 in the mask channel. The
-        static map is repeated across all T input days.
+        zeroed (the normalized mean) and marked 0 in the mask channel.
         """
         npz_path, _ = self.index[idx]
         tessera_path = self.tessera_dir / npz_path.name
@@ -423,7 +429,7 @@ class FireDataset(Dataset):
             (embedding, valid[None].astype(np.float32)),
             axis=0,
         ).astype(np.float32)
-        return torch.from_numpy(static).unsqueeze(1).expand(-1, ts_length, -1, -1)
+        return torch.from_numpy(static)
 
     def preprocess(self, x):
         # - OLD: transform angular degree features after augmentation.
@@ -470,9 +476,10 @@ class FireDataset(Dataset):
         )
         return x
 
-    def augment(self, x, y):
+    def augment(self, x, y, static=None):
         # - OLD: independently choose horizontal flip, vertical flip, and a
         # - OLD: multiple-of-90-degree rotation for each training sample.
+        # * NEW: `static` (the TESSERA map, or None) is transformed with x.
         hflip = bool(np.random.random() > 0.5)
         vflip = bool(np.random.random() > 0.5)
         rotate = int(np.floor(np.random.random() * 4))
@@ -480,6 +487,8 @@ class FireDataset(Dataset):
         if hflip:
             x = TF.hflip(x)
             y = TF.hflip(y)
+            if static is not None:
+                static = TF.hflip(static)
 
             # - OLD: reflect directional angles across the vertical axis.
             x[self.indices_of_degree_features] = (
@@ -489,6 +498,8 @@ class FireDataset(Dataset):
         if vflip:
             x = TF.vflip(x)
             y = TF.vflip(y)
+            if static is not None:
+                static = TF.vflip(static)
 
             # - OLD: reflect directional angles across the horizontal axis.
             x[self.indices_of_degree_features] = (
@@ -502,13 +513,15 @@ class FireDataset(Dataset):
             # * NEW: both (2,H,W) and (2,T,H,W); no squeeze/unsqueeze is needed.
             x = TF.rotate(x, angle)
             y = TF.rotate(y, angle)
+            if static is not None:
+                static = TF.rotate(static, angle)
 
             # - OLD: rotate directional values consistently with the raster.
             x[self.indices_of_degree_features] = (
                 x[self.indices_of_degree_features] - angle
             ) % 360
 
-        return x, y
+        return x, y, static
 
 
 if __name__ == "__main__":
