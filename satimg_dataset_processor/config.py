@@ -11,10 +11,10 @@ a setting for one call without editing this file.
 # Input days per window. A fire needs TS_LENGTH + 1 VIIRS_Day images (the
 # extra day is the target), so fires with fewer images produce no windows.
 # The TS-SatFire paper's prediction benchmark uses 6 input days.
-TS_LENGTH = 10
+TS_LENGTH = 6
 
 # Days between the first input day of consecutive windows.
-TS_INTERVAL = 3
+TS_INTERVAL = 1
 
 # ----- Hugging Face dataset repositories ----- #
 
