@@ -207,6 +207,8 @@ class DatasetStreamer(PredDatasetProcessor):
             else:
                 print(f"{loc_name}: no output saved")
 
+            # Free this fire's windows before the next fire is built.
+            del loc_x, loc_y
             shutil.rmtree(self.temp_dir, ignore_errors=True)
             gc.collect()
 

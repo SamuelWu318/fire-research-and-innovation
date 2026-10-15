@@ -1,4 +1,5 @@
 import os
+import zipfile
 from glob import glob
 
 import matplotlib.pyplot as plt
@@ -6,7 +7,7 @@ import numpy as np
 import pandas as pd
 import rasterio
 
-from satimg_dataset_processor.config import TS_INTERVAL, TS_LENGTH
+from satimg_dataset_processor.config import NPZ_COMPRESSLEVEL, TS_INTERVAL, TS_LENGTH
 from satimg_dataset_processor.utils import SatProcessingUtils
 
 class AFBADatasetProcessor(SatProcessingUtils):
@@ -299,7 +300,13 @@ class PredDatasetProcessor(SatProcessingUtils):
         return np.isfinite(array) & (array > 0)
 
     @staticmethod
-    def _save_windowed_npz(save_path, data, labels, label_sel=None):
+    def _save_windowed_npz(
+        save_path,
+        data,
+        labels,
+        label_sel=None,
+        compresslevel=NPZ_COMPRESSLEVEL,
+    ):
         """Save each temporal window as its own compressed NPZ member.
 
         Unlike saving `data` as one five-dimensional member, this layout lets
@@ -327,7 +334,22 @@ class PredDatasetProcessor(SatProcessingUtils):
             payload[f"data_{suffix}"] = data[window_idx]
             payload[f"label_{suffix}"] = labels[window_idx]
 
-        np.savez_compressed(save_path, **payload)
+        # np.savez_compressed's own writer with an explicit zlib level: the
+        # same .npy members and arrays, only the compressed bytes differ.
+        with zipfile.ZipFile(
+            save_path,
+            "w",
+            compression=zipfile.ZIP_DEFLATED,
+            compresslevel=compresslevel,
+            allowZip64=True,
+        ) as zip_file:
+            for key, value in payload.items():
+                with zip_file.open(f"{key}.npy", "w", force_zip64=True) as member:
+                    np.lib.format.write_array(
+                        member,
+                        np.asanyarray(value),
+                        allow_pickle=False,
+                    )
 
         # This checks the ZIP member index and tiny metadata member without
         # decompressing every data window again.
@@ -376,13 +398,27 @@ class PredDatasetProcessor(SatProcessingUtils):
             print(f"{loc_name}: no VIIRS_Day files")
             return None, None
 
-        array_stack = []
-        label_stack = []
-
         n_channels = 27
         output_shape_x = 256
         output_shape_y = 256
         offset = 128
+
+        # Windows go straight into one (windows, C, T, H, W) array. Stacking
+        # per-window arrays, transposing and copying again tripled the RAM a
+        # long fire needs (about 10 GiB for an 87-day fire).
+        n_windows = sum(
+            1
+            for i in range(0, len(day_files), interval)
+            if i + length < len(day_files)
+        )
+        loc_x = np.zeros(
+            (n_windows, n_channels, length, output_shape_x, output_shape_y),
+            dtype=np.float32,
+        )
+        loc_y = np.zeros(
+            (n_windows, output_shape_x, output_shape_y),
+            dtype=np.float32,
+        )
 
         # Label accumulators must be Boolean. Raw NaNs must never be passed
         # directly to np.logical_or because bool(np.nan) is True.
@@ -400,25 +436,11 @@ class PredDatasetProcessor(SatProcessingUtils):
         )
         new_base_max_img = max_img.copy()
 
-        for i in range(0, len(day_files), interval):
+        for window_idx, i in enumerate(range(0, len(day_files), interval)):
             # A window needs `length` input frames plus one target frame.
             if i + length >= len(day_files):
                 print(f"{loc_name}: dropping incomplete tail")
                 break
-
-            output_array = np.zeros(
-                (
-                    length,
-                    n_channels,
-                    output_shape_x,
-                    output_shape_y,
-                ),
-                dtype=np.float32,
-            )
-            output_label = np.zeros(
-                (output_shape_x, output_shape_y),
-                dtype=np.float32,
-            )
 
             for j in range(length + 1):
                 file_name = day_files[i + j]
@@ -576,13 +598,13 @@ class PredDatasetProcessor(SatProcessingUtils):
 
                 if j < length:
                     prev_final_label = final_label.copy()
-                    output_array[j] = img
+                    loc_x[window_idx, :, j] = img
                 else:
                     new_mask = np.logical_and(
                         np.logical_not(prev_final_label),
                         final_label,
                     )
-                    output_label[:] = new_mask.astype(np.float32)
+                    loc_y[window_idx] = new_mask
 
                     if debug:
                         print(
@@ -598,20 +620,14 @@ class PredDatasetProcessor(SatProcessingUtils):
             ba_label = new_base_ba_label.copy()
             max_img = new_base_max_img.copy()
 
-            array_stack.append(output_array)
-            label_stack.append(output_label)
-
-        if not array_stack:
+        if n_windows == 0:
             print(f"{loc_name}: not enough time-series frames")
             return None, None
 
-        loc_x = np.stack(array_stack, axis=0).transpose(
-            (0, 2, 1, 3, 4)
-        ).astype(np.float32)
-        loc_y = np.stack(label_stack, axis=0).astype(np.float32)
-
-        if not np.isfinite(loc_x).all():
-            raise ValueError(f"{loc_name}: processed inputs contain NaN/Inf")
+        # One window at a time, so the check needs no full-size mask.
+        for window in loc_x:
+            if not np.isfinite(window).all():
+                raise ValueError(f"{loc_name}: processed inputs contain NaN/Inf")
         if not np.isfinite(loc_y).all():
             raise ValueError(f"{loc_name}: processed labels contain NaN/Inf")
 
