@@ -1,3 +1,16 @@
+# ============================================================================
+# NOT USED BY OUR CURRENT WORK (SwinUNETR-3D next-day fire prediction).
+#
+# Nothing in our pipeline runs or imports this file: not the two notebooks,
+# dataset_gen_pred.py, or run_spatial_temp_model_pred.py. Do not modify it for
+# that work; changes here have no effect on it.
+#
+# What it does: Keras layer for t4fire.py that returns a learned position
+# embedding for each time step.
+#
+# From the original TS-SatFire code (https://github.com/zhaoyutim/TS-SatFire).
+# ============================================================================
+
 # Licensed under the Apache License, Version 2.0 (the 'License');
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at

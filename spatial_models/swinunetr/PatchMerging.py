@@ -23,7 +23,8 @@ class PatchMerging(nn.Module):
         input_resolution,
         dim:          int,
         norm_layer:   Type[LayerNorm] = nn.LayerNorm,
-        spatial_dims: int = 3
+        spatial_dims: int = 3,
+        merge_temporal: bool = True
     ) -> None:
         '''
         Args:
@@ -31,6 +32,7 @@ class PatchMerging(nn.Module):
             dim:              number of feature channels.
             norm_layer:       normalization layer.
             spatial_dims:     number of spatial dims.
+            merge_temporal:   also merge along the first (temporal) dim when it is even.
         '''
 
         super().__init__()
@@ -39,7 +41,7 @@ class PatchMerging(nn.Module):
         self.dim = dim
         self.input_resolution = input_resolution
         D, H, W = self.input_resolution
-        self.merge_D = D % 2 == 0
+        self.merge_D = merge_temporal and D % 2 == 0
         self.merge_H = H % 2 == 0
         self.merge_W = W % 2 == 0
 

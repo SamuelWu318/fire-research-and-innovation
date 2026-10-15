@@ -268,7 +268,10 @@ class FireDataset(Dataset):
         )
 
         # - OLD: land-cover values 1..17 are converted to 17 one-hot channels.
-        self.one_hot_matrix = torch.eye(17, dtype=torch.float32)
+        # * NEW: a leading zero row encodes missing land cover (0) as no class.
+        self.one_hot_matrix = torch.cat(
+            (torch.zeros(1, 17), torch.eye(17)), dim=0
+        )
 
     def __len__(self):
         # * NEW: the Dataset length is the number of windows across all fires,
@@ -433,27 +436,30 @@ class FireDataset(Dataset):
             x.shape[1],
             x.shape[2],
             x.shape[3],
-            self.one_hot_matrix.shape[0],
+            self.one_hot_matrix.shape[1],
         )
 
         # - OLD: source land-cover classes use integer identifiers 1..17.
         landcover_classes = x[21].long()
 
-        # * NEW: reject invalid identifiers rather than allowing zero to become
-        # * NEW: index -1, which would silently misclassify it as class 17.
-        invalid_landcover = (landcover_classes < 1) | (
-            landcover_classes > self.one_hot_matrix.shape[0]
+        # * NEW: 0 is a missing value (preprocessing replaces NaN with 0). The
+        # * NEW: paper reads a zero land cover as "an absence of all land
+        # * NEW: covers", so it gets an all-zero encoding; the released code
+        # * NEW: indexed it as -1, silently misclassifying it as class 17.
+        invalid_landcover = (landcover_classes < 0) | (
+            landcover_classes > self.one_hot_matrix.shape[1]
         )
         if torch.any(invalid_landcover):
             invalid_values = torch.unique(
                 landcover_classes[invalid_landcover]
             ).tolist()
             raise ValueError(
-                "Land-cover channel contains values outside 1..17: "
+                "Land-cover channel contains values outside 0..17: "
                 f"{invalid_values[:20]}"
             )
 
-        landcover_flat = landcover_classes.flatten() - 1
+        # Row 0 of the padded matrix is the all-zero encoding for class 0.
+        landcover_flat = landcover_classes.flatten()
         landcover_encoding = self.one_hot_matrix[landcover_flat].reshape(
             new_shape
         ).permute(3, 0, 1, 2)

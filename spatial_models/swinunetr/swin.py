@@ -5,6 +5,7 @@ import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 
 from copy import deepcopy
+from functools import partial
 from einops import rearrange
 from torch.nn import LayerNorm
 from typing import Optional, Sequence, Type
@@ -323,6 +324,7 @@ class SwinTransformer(nn.Module):
         patch_norm:     bool = False,
         use_checkpoint: bool = False,
         spatial_dims:   int = 3,
+        temporal_downsample: bool = True,
     ) -> None:
         '''
         Args:
@@ -342,6 +344,7 @@ class SwinTransformer(nn.Module):
             patch_norm:     add normalization after patch embedding.
             use_checkpoint: use gradient checkpointing for reduced memory usage.
             spatial_dims:   spatial dimension.
+            temporal_downsample: patch merging also halves the first (temporal) dim when it is even.
         '''
 
         super().__init__()
@@ -380,7 +383,7 @@ class SwinTransformer(nn.Module):
                 attn_drop        = attn_drop_rate,
                 attn_version     = attn_version,
                 norm_layer       = norm_layer,
-                downsample       = PatchMerging,
+                downsample       = partial(PatchMerging, merge_temporal=temporal_downsample),
                 use_checkpoint   = use_checkpoint,
             )
             if i_layer == 0:

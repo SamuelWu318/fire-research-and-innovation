@@ -169,8 +169,15 @@ def build_model(
     num_heads,
     hidden_size,
     unetr_version,
+    swin_temporal_downsample=False,
 ):
-    """Build the requested spatial-temporal model."""
+    """Build the requested spatial-temporal model.
+
+    swin_temporal_downsample=False follows the TS-SatFire paper ("we do not
+    use downsampling in the temporal dimension in any of our models"); True
+    is the released code, whose Swin patch merging also halves an even
+    number of days (6 -> 3).
+    """
     image_size = (ts_length, 256, 256)
 
     if model_name == "unet3d":
@@ -233,6 +240,7 @@ def build_model(
             normalize=True,
             use_checkpoint=False,
             spatial_dims=3,
+            temporal_downsample=swin_temporal_downsample,
         )
 
     raise NotImplementedError(f"Unsupported model: {model_name}")
@@ -378,7 +386,7 @@ def train_model(
     checkpoint_extra=None,
     artifact_name=None,
 ):
-    """Train and validate while retaining the best validation checkpoints."""
+    """Train and validate; return the checkpoint with the lowest validation loss."""
     metric_labels = build_wandb_metric_labels(
         "dicece" if isinstance(criterion, DiceCELoss) else "dice"
     )
@@ -597,6 +605,8 @@ def train_model(
         reverse=True,
     ):
         print(f"loss={-negative_loss:.6f}: {checkpoint_path}")
+    # Heap entries are (-loss, path), so the largest is the lowest loss.
+    return max(best_checkpoints)[1]
 
 
 def normalize_for_plot(array):
@@ -787,14 +797,17 @@ def evaluate_model(
         f"Model F1: {model_f1}; background F1: {model_background_f1}; "
         f"model IoU: {model_iou}"
     )
-    wandb.log(
-        {
-            "test_f1": model_f1,
-            "test_iou": model_iou,
-            "Test F1 — Next-Day Fire Growth": model_f1,
-            "Test F1 — Background": model_background_f1,
-        }
-    )
+    test_metrics = {
+        "test_f1": model_f1,
+        "test_iou": model_iou,
+        "Test F1 — Next-Day Fire Growth": model_f1,
+        "Test IoU — Next-Day Fire Growth": model_iou,
+        "Test F1 — Background": model_background_f1,
+        "test_fires": evaluated_fire_count,
+    }
+    wandb.log(test_metrics)
+    # One value per run: the summary shows it in the run overview and table.
+    wandb.run.summary.update(test_metrics)
 
 
 def parse_args():
@@ -849,9 +862,16 @@ def parse_args():
     parser.add_argument("--load-epoch", type=int, default=199)
     parser.add_argument(
         "--test-csv",
-        default="~/CalFireMonitoring/roi/us_fire_2021_out_new.csv",
+        default=str(Path(__file__).resolve().parent / "roi" / "us_fire_2021_out_new.csv"),
     )
     parser.add_argument("--plot-dir", default="evaluation_plot")
+    parser.add_argument(
+        "--test-after-train",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="After training, score the test fires with the lowest-validation-loss "
+        "checkpoint and log test F1/IoU to the same W&B run",
+    )
     parser.add_argument(
         "--tessera",
         action="store_true",
@@ -865,9 +885,16 @@ def parse_args():
     parser.add_argument(
         "--loss",
         choices=("dice", "dicece"),
-        default="dice",
+        default=None,
         help="dice: released TS-SatFire code. dicece: the paper's prediction "
-        "loss, 1:1 Dice + CE with --ce-weight (use with -lr 0.001)",
+        "loss, 1:1 Dice + CE with --ce-weight (use with -lr 0.001). Default: "
+        "the paper's choice per model, dice for attunet and dicece otherwise",
+    )
+    parser.add_argument(
+        "--swin-temporal-downsample",
+        action="store_true",
+        help="swinunetr3d: also halve the days in patch merging, as the released "
+        "code does. Default follows the paper: no temporal downsampling",
     )
     parser.add_argument(
         "--ce-weight",
@@ -904,6 +931,10 @@ def main():
 
     model_name = args.m
     mode = args.mode
+    if args.loss is None:
+        # Paper: Dice+CE for U-Net-3D, UNETR-3D and SwinUNETR-3D; the
+        # Attention-U-Net-3D "kept the original setup of using Dice loss".
+        args.loss = "dice" if model_name == "attunet" else "dicece"
     batch_size = args.b
     num_heads = args.nh
     hidden_size = args.ed
@@ -983,7 +1014,10 @@ def main():
         num_heads=num_heads,
         hidden_size=hidden_size,
         unetr_version=args.unetr_version,
+        swin_temporal_downsample=args.swin_temporal_downsample,
     )
+    if model_name == "swinunetr3d":
+        wandb.config.update({"swin_temporal_downsample": args.swin_temporal_downsample})
     model = nn.DataParallel(model)
     model.to(device)
 
@@ -1064,7 +1098,7 @@ def main():
             "checkpoint_epoch_{epoch}_"
             f"nc_{model_input_channels}_ts_{ts_length}{run_tag}.pth"
         )
-        train_model(
+        best_checkpoint = train_model(
             model=model,
             model_name=model_name,
             train_dataset=train_dataset,
@@ -1084,6 +1118,7 @@ def main():
             checkpoint_extra={
                 "use_tessera": use_tessera,
                 "model_input_channels": model_input_channels,
+                "swin_temporal_downsample": args.swin_temporal_downsample,
                 "tessera_stats": tessera_stats,
                 "loss_config": loss_config,
             },
@@ -1093,19 +1128,25 @@ def main():
                 else None
             ),
         )
-        return
-
-    checkpoint_path = args.checkpoint
-    if checkpoint_path is None:
-        checkpoint_path = (
-            Path("saved_models")
-            / (
-                f"model_{model_name}_mode_{mode}_num_heads_{num_heads}_"
-                f"hidden_size_{hidden_size}_batchsize_{batch_size}_"
-                f"checkpoint_epoch_{args.load_epoch}_"
-                f"nc_{model_input_channels}_ts_{ts_length}{run_tag}.pth"
+        if not args.test_after_train:
+            return
+        if not any(test_npz_dir.glob("*.npz")):
+            print(f"No test archives in {test_npz_dir}; skipping the test step")
+            return
+        # The paper's metrics on the test fires, from the best-validation checkpoint.
+        checkpoint_path = best_checkpoint
+    else:
+        checkpoint_path = args.checkpoint
+        if checkpoint_path is None:
+            checkpoint_path = (
+                Path("saved_models")
+                / (
+                    f"model_{model_name}_mode_{mode}_num_heads_{num_heads}_"
+                    f"hidden_size_{hidden_size}_batchsize_{batch_size}_"
+                    f"checkpoint_epoch_{args.load_epoch}_"
+                    f"nc_{model_input_channels}_ts_{ts_length}{run_tag}.pth"
+                )
             )
-        )
 
     # weights_only=False: the checkpoint also stores the TESSERA statistics.
     checkpoint = torch.load(
@@ -1120,6 +1161,15 @@ def main():
             f"{checkpoint_path} was trained "
             f"{'with' if trained_with_tessera else 'without'} TESSERA; "
             f"{'add' if trained_with_tessera else 'remove'} --tessera"
+        )
+    # Checkpoints from before this flag used the released code's merging.
+    trained_temporal_downsample = bool(checkpoint.get("swin_temporal_downsample", True))
+    if model_name == "swinunetr3d" and trained_temporal_downsample != args.swin_temporal_downsample:
+        raise ValueError(
+            f"{checkpoint_path} was trained "
+            f"{'with' if trained_temporal_downsample else 'without'} temporal "
+            f"downsampling; {'add' if trained_temporal_downsample else 'remove'} "
+            "--swin-temporal-downsample"
         )
 
     test_dataset = FireDataset(

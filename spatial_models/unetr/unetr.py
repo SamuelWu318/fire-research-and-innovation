@@ -1,3 +1,18 @@
+# ============================================================================
+# NOT USED BY SWINUNETR-3D (our current work: next-day fire prediction).
+#
+# run_spatial_temp_model_pred.py imports this file, but SwinUNETR-3D runs
+# never call it. Do not modify it for SwinUNETR-3D work; changes here do not
+# affect those runs. It must still import cleanly, or the training script will
+# not start.
+#
+# What it does: UNETR, a MONAI copy: a Vision Transformer encoder with a
+# U-Net-style decoder. It is the paper's UNETR-3D baseline, built only for `-m
+# unetr3d`.
+#
+# From the original TS-SatFire code (https://github.com/zhaoyutim/TS-SatFire).
+# ============================================================================
+
 # Copyright (c) MONAI Consortium
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.

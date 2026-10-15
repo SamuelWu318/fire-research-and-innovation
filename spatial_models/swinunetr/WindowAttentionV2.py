@@ -1,3 +1,19 @@
+# ============================================================================
+# NOT USED BY SWINUNETR-3D (our current work: next-day fire prediction).
+#
+# spatial_models/swinunetr/swin.py imports this file, but SwinUNETR-3D runs
+# never call it. Do not modify it for SwinUNETR-3D work; changes here do not
+# affect those runs. It must still import cleanly, or the training script will
+# not start.
+#
+# What it does: Swin Transformer V2 window attention (scaled cosine attention
+# with a continuous position bias). swin.py uses it only when the model is
+# built with attn_version='v2'. Our prediction script builds SwinUNETR-3D with
+# attn_version='v1', which uses WindowAttentionV1.py.
+#
+# From the original TS-SatFire code (https://github.com/zhaoyutim/TS-SatFire).
+# ============================================================================
+
 from typing import Sequence
 
 import numpy as np

@@ -1,3 +1,20 @@
+# ============================================================================
+# NOT USED BY SWINUNETR-3D (our current work: next-day fire prediction).
+#
+# spatial_models/swinunetr/swin.py imports this file, but SwinUNETR-3D runs
+# never call it. Do not modify it for SwinUNETR-3D work; changes here do not
+# affect those runs. It must still import cleanly, or the training script will
+# not start.
+#
+# What it does: A window-attention variant that adds an extra time mask
+# (temp_attn_mask) to the attention scores, meant to limit which days each day
+# can attend to. swin.py uses it only when the model is built with
+# attn_version='ar'. Our prediction script builds SwinUNETR-3D with
+# attn_version='v1', which uses WindowAttentionV1.py.
+#
+# From the original TS-SatFire code (https://github.com/zhaoyutim/TS-SatFire).
+# ============================================================================
+
 from typing import Sequence
 
 import numpy as np

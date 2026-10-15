@@ -1,3 +1,20 @@
+# ============================================================================
+# NOT USED BY OUR CURRENT WORK (SwinUNETR-3D next-day fire prediction).
+#
+# Nothing in our pipeline runs or imports this file: not the two notebooks,
+# dataset_gen_pred.py, or run_spatial_temp_model_pred.py. Do not modify it for
+# that work; changes here have no effect on it.
+#
+# What it does: Builds the datasets for the paper's other two tasks,
+# active-fire detection (-uc af) and burned-area mapping (-uc ba). It reads
+# GeoTIFFs from the original authors' local folders, cuts 8-channel VIIRS time
+# series into windows and saves .npy files. Our --use_tessera_embeddings
+# option (never used) appends 128 TESSERA channels. Prediction data is built
+# by dataset_gen_pred.py and satimg_dataset_processor/hf_dataset.py instead.
+#
+# From the original TS-SatFire code (https://github.com/zhaoyutim/TS-SatFire).
+# ============================================================================
+
 import argparse
 import pandas as pd
 import os

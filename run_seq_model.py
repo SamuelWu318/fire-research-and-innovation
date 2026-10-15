@@ -1,3 +1,18 @@
+# ============================================================================
+# NOT USED BY OUR CURRENT WORK (SwinUNETR-3D next-day fire prediction).
+#
+# Nothing in our pipeline runs or imports this file: not the two notebooks,
+# dataset_gen_pred.py, or run_spatial_temp_model_pred.py. Do not modify it for
+# that work; changes here have no effect on it.
+#
+# What it does: Trains and tests the paper's pixel time-series models (GRU,
+# LSTM and T4Fire from temporal_models/) for active-fire detection, in
+# TensorFlow. Each pixel's time series is classified on its own; data comes
+# from satimg_dataset_processor/data_generator_tf.py.
+#
+# From the original TS-SatFire code (https://github.com/zhaoyutim/TS-SatFire).
+# ============================================================================
+
 import argparse
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3' 

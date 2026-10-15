@@ -52,7 +52,8 @@ class SwinUNETR(nn.Module):
         attn_version:   str = 'v2',
         normalize:      bool = True,
         use_checkpoint: bool = False,
-        spatial_dims:   int = 3
+        spatial_dims:   int = 3,
+        temporal_downsample: bool = True
     ) -> None:
         '''
         Args:
@@ -72,6 +73,7 @@ class SwinUNETR(nn.Module):
             normalize:      normalize output intermediate features in each stage.
             use_checkpoint: use gradient checkpointing for reduced memory usage.
             spatial_dims:   number of spatial dims.
+            temporal_downsample: patch merging also halves the first (temporal) dim when it is even.
         '''
 
         super().__init__()
@@ -121,7 +123,8 @@ class SwinUNETR(nn.Module):
             attn_version   = attn_version,
             norm_layer     = nn.LayerNorm,
             use_checkpoint = use_checkpoint,
-            spatial_dims   = spatial_dims
+            spatial_dims   = spatial_dims,
+            temporal_downsample = temporal_downsample
         )
         resamples = self.swinViT.resamples
 

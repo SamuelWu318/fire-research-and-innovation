@@ -422,7 +422,7 @@ class PredDatasetProcessor(SatProcessingUtils):
 
             for j in range(length + 1):
                 file_name = day_files[i + j]
-                array_day, _ = self.read_tiff(file_name)
+                array_day, day_profile = self.read_tiff(file_name)
 
                 if array_day.shape[0] < 7:
                     raise ValueError(
@@ -437,25 +437,36 @@ class PredDatasetProcessor(SatProcessingUtils):
                     "VIIRS_Day",
                     "VIIRS_Night",
                 )
+                array_night = None
                 if os.path.exists(night_file):
-                    array_night, _ = self.read_tiff(night_file)
+                    array_night, night_profile = self.read_tiff(night_file)
                     if array_night.shape[0] == 5:
                         print(f"{night_file}: correcting day/night alignment")
                         array_night = array_night[3:, :, :]
 
                     if array_night.shape[0] < 2:
-                        raise ValueError(
-                            f"{night_file}: expected at least 2 bands, "
-                            f"found {array_night.shape[0]}"
+                        # Unusable night capture: a missing value, so zeros
+                        # (TS-SatFire paper), like a missing night file.
+                        print(
+                            f"{night_file}: {array_night.shape[0]} band(s); "
+                            "using zeros"
+                        )
+                        array_night = None
+                    elif array_night.shape[1:] != array_day.shape[1:]:
+                        # The crop is by pixel index, so it only matches the
+                        # day crop when both rasters share one grid.
+                        if night_profile["transform"] != day_profile["transform"]:
+                            raise ValueError(
+                                f"Day/night grid mismatch for {file_name}: "
+                                f"{array_day.shape[1:]} versus "
+                                f"{array_night.shape[1:]}"
+                            )
+                        print(
+                            f"{night_file}: size {array_night.shape[1:]} differs "
+                            f"from day {array_day.shape[1:]} on the same grid"
                         )
 
-                    if array_night.shape[1:] != array_day.shape[1:]:
-                        raise ValueError(
-                            f"Day/night spatial mismatch for {file_name}: "
-                            f"{array_day.shape[1:]} versus "
-                            f"{array_night.shape[1:]}"
-                        )
-                else:
+                if array_night is None:
                     array_night = np.zeros(
                         (2, original_shape_x, original_shape_y),
                         dtype=np.float32,

@@ -1,3 +1,20 @@
+# ============================================================================
+# NOT USED BY OUR CURRENT WORK (SwinUNETR-3D next-day fire prediction).
+#
+# Nothing in our pipeline runs or imports this file: not the two notebooks,
+# dataset_gen_pred.py, or run_spatial_temp_model_pred.py. Do not modify it for
+# that work; changes here have no effect on it.
+#
+# What it does: Checks an active-fire or burned-area .npy dataset built by
+# dataset_gen_afba.py --use_tessera_embeddings (8 VIIRS channels + 128 TESSERA
+# channels): its shape, that every value is finite, that the TESSERA channels
+# are the same on every day, and optionally that the first 8 channels match
+# the original dataset. Prediction TESSERA inputs are checked by
+# satimg_dataset_processor/data_generator_pred_torch.py.
+#
+# Added by us for an earlier experiment.
+# ============================================================================
+
 import argparse
 
 import numpy as np
