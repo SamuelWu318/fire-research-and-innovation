@@ -38,13 +38,14 @@ from huggingface_hub import HfApi, hf_hub_download, login
 from tqdm.auto import tqdm
 
 from satimg_dataset_processor.config import (
-    DEFAULT_LABEL_SEL,
     LABEL_SEL_FILE,
+    LEGACY_LABEL_SEL,
     LEGACY_WINDOW_SETTINGS,
     PROCESSED_REPO,
     SRC_REPO,
     TESSERA_REPO,
     TEST_YEARS,
+    TRAIN_VAL_LABEL_SEL,
     TRAIN_VAL_YEARS,
     TS_INTERVAL,
     TS_LENGTH,
@@ -185,9 +186,9 @@ class DatasetStreamer(PredDatasetProcessor):
                         token=self.token,
                     )
 
-            label_sel = DEFAULT_LABEL_SEL
+            label_sel = TRAIN_VAL_LABEL_SEL
             if label_sel_by_id is not None:
-                label_sel = int(label_sel_by_id.get(loc_name, DEFAULT_LABEL_SEL))
+                label_sel = int(label_sel_by_id.get(loc_name, TRAIN_VAL_LABEL_SEL))
 
             loc_x, loc_y = self.process_location(
                 loc_name,
@@ -411,6 +412,7 @@ def process_data(
     overwrite=False,
     debug=False,
     use_roi_label_sel=True,
+    train_val_label_sel=TRAIN_VAL_LABEL_SEL,
 ):
     """Stream raw fires from `src_repo` into windows of `length` input days.
 
@@ -418,9 +420,11 @@ def process_data(
     by default window_repo_for(length, interval), so different settings never
     share a repo. `token` needs write access to `window_repo`.
 
-    Targets use each fire's ROI label_sel (DEFAULT_LABEL_SEL when absent),
-    like the original TS-SatFire generator; `use_roi_label_sel=False` uses
-    DEFAULT_LABEL_SEL for every fire. Fires already in `window_repo` are
+    Targets follow the TS-SatFire paper: train/val fires use
+    `train_val_label_sel` (default TRAIN_VAL_LABEL_SEL = 0, the union of
+    accumulated active fire and NIFC perimeters) and test fires use their ROI
+    label_sel (the paper's per-fire choice). `use_roi_label_sel=False` uses
+    `train_val_label_sel` for test fires too. Fires already in `window_repo` are
     skipped unless `overwrite` is set, except fires whose recorded label_sel
     differs from the one wanted: those are rebuilt so every archive follows
     the current rule. The rule per archive is recorded in label_sel.json.
@@ -442,11 +446,16 @@ def process_data(
     train_ids, val_ids, test_ids = obtain_ids(src_repo, token, roi_dir)
     ids_by_split = {"train": train_ids, "val": val_ids, "test": test_ids}
 
-    label_sel_by_id = (
+    roi_label_sel = (
         fire_label_sel(download_roi_csvs(src_repo, token, roi_dir))
         if use_roi_label_sel
         else {}
     )
+    label_sel_by_id = {
+        str(fire_id): int(roi_label_sel.get(str(fire_id), train_val_label_sel))
+        for split_name in splits
+        for fire_id in ids_by_split[split_name]
+    }
     manifest = read_label_sel_manifest(processor.api, window_repo, token)
     existing_files = set(processor.api.list_repo_files(window_repo, repo_type="dataset"))
 
@@ -455,8 +464,8 @@ def process_data(
         stale = []
         for fire_id in ids_by_split[split_name]:
             repo_path = f"{split_name}/p{fire_id}.npz"
-            wanted = int(label_sel_by_id.get(str(fire_id), DEFAULT_LABEL_SEL))
-            if repo_path in existing_files and manifest.get(repo_path, DEFAULT_LABEL_SEL) != wanted:
+            wanted = label_sel_by_id[str(fire_id)]
+            if repo_path in existing_files and manifest.get(repo_path, LEGACY_LABEL_SEL) != wanted:
                 stale.append(str(fire_id))
         if stale:
             print(f"{split_name}: rebuilding {len(stale)} processed fires whose label_sel changed: {stale}")

@@ -44,17 +44,22 @@ WINDOW_CONFIG_FILE = "window_config.json"
 
 # ----- Prediction labels ----- #
 
-# The target is the pixels newly burned on the day after the input window.
-# label_sel 1: "burned" = accumulated active fire (AF) only.
-# label_sel 0: "burned" = accumulated AF plus the burned-area (BA) band.
-# Like the original TS-SatFire generator, process_data uses each fire's
-# label_sel column from the ROI CSVs (2021 test fires) and this default for
-# fires without one (all train/val fires).
-DEFAULT_LABEL_SEL = 1
+# The target is the pixels newly burned on the day after the input window:
+# "the difference between the burned area masks of the last observed day and
+# the next day" (TS-SatFire paper). label_sel picks the burned-area mask:
+#   0: union of accumulated VIIRS active fire (AF) and the NIFC perimeters
+#      (BA band). The paper's training label, and test option (a).
+#   1: accumulated AF only. Test option (b), chosen per fire by visual
+#      inspection "to avoid the high commission errors of NIFC perimeters".
+# Train/val fires use TRAIN_VAL_LABEL_SEL; test fires use the label_sel
+# column of the 2021 ROI CSV, which records the paper's per-fire choice.
+# The released TS-SatFire code used 1 for train/val; set 1 to reproduce it.
+TRAIN_VAL_LABEL_SEL = 0
 
 # Window repo manifest {"<split>/p<id>.npz": label_sel}. Archives missing from
-# it were built before it existed, with DEFAULT_LABEL_SEL.
+# it were built before it existed, with LEGACY_LABEL_SEL.
 LABEL_SEL_FILE = "label_sel.json"
+LEGACY_LABEL_SEL = 1
 
 # ----- Train / validation / test split ----- #
 

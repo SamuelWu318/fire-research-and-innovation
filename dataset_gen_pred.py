@@ -20,7 +20,7 @@ defaults to the repo for the chosen -ts/-it (config.window_repo_for).
 import argparse
 import os
 
-from satimg_dataset_processor.config import TS_INTERVAL, TS_LENGTH, window_repo_for
+from satimg_dataset_processor.config import TRAIN_VAL_LABEL_SEL, TS_INTERVAL, TS_LENGTH, window_repo_for
 from satimg_dataset_processor.hf_dataset import (
     PROCESSED_REPO,
     SRC_REPO,
@@ -99,7 +99,14 @@ def parse_args():
     process.add_argument(
         "--ignore-roi-label-sel",
         action="store_true",
-        help="Use label_sel 1 (active fire only) for every fire instead of the ROI value",
+        help="Use --train-val-label-sel for test fires too instead of their ROI value",
+    )
+    process.add_argument(
+        "--train-val-label-sel",
+        type=int,
+        choices=(0, 1),
+        default=TRAIN_VAL_LABEL_SEL,
+        help="Train/val burned-area mask: 0 = AF + NIFC perimeters (paper), 1 = AF only (released code)",
     )
 
     tessera = subparsers.add_parser(
@@ -200,6 +207,7 @@ if __name__ == '__main__':
             overwrite=args.overwrite,
             debug=args.debug,
             use_roi_label_sel=not args.ignore_roi_label_sel,
+            train_val_label_sel=args.train_val_label_sel,
         )
     elif args.command == "tessera":
         process_tessera(
