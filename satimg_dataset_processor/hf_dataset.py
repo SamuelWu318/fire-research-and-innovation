@@ -38,8 +38,6 @@ from huggingface_hub import HfApi, hf_hub_download, login
 from tqdm.auto import tqdm
 
 from satimg_dataset_processor.config import (
-    LABEL_SEL_FILE,
-    LEGACY_LABEL_SEL,
     LEGACY_WINDOW_SETTINGS,
     PROCESSED_REPO,
     SRC_REPO,
@@ -128,16 +126,11 @@ class DatasetStreamer(PredDatasetProcessor):
         label_sel_by_id=None,
         overwrite=False,
         debug=False,
-        reprocess=(),
     ):
         """Process `target_ids` into <split_name>/p<id>.npz in the dest repo.
 
-        Fires already in the repo are skipped unless `overwrite` is set or
-        they are listed in `reprocess`. Returns {repo path: label_sel} for
-        every archive written.
+        Fires already in the repo are skipped unless `overwrite` is set.
         """
-        reprocess = {str(fire_id) for fire_id in reprocess}
-        written = {}
         locations = self.get_repo_locations()
         existing_files = set(
             self.api.list_repo_files(
@@ -165,7 +158,7 @@ class DatasetStreamer(PredDatasetProcessor):
         for loc_idx, loc_name in enumerate(valid_locations):
             dest_filename = f"{split_name}/p{loc_name}.npz"
 
-            if dest_filename in existing_files and not overwrite and loc_name not in reprocess:
+            if dest_filename in existing_files and not overwrite:
                 print(f"Skipping {loc_name}: already processed")
                 continue
 
@@ -210,7 +203,6 @@ class DatasetStreamer(PredDatasetProcessor):
                     labels=loc_y,
                     label_sel=label_sel,
                 )
-                written[dest_filename] = label_sel
                 staged_count += 1
             else:
                 print(f"{loc_name}: no output saved")
@@ -251,8 +243,6 @@ class DatasetStreamer(PredDatasetProcessor):
                 current_staging_dir,
                 ignore_errors=True,
             )
-
-        return written
 
 
 # ----- SPLITTING ----- #
@@ -297,21 +287,6 @@ def fire_label_sel(roi_paths):
             if label_sel.setdefault(fire_id, value) != value:
                 raise ValueError(f"ROI CSVs disagree on label_sel for {fire_id}")
     return label_sel
-
-
-def read_label_sel_manifest(api, window_repo, token=None):
-    """Return {"<split>/p<id>.npz": label_sel} recorded in `window_repo`."""
-    if LABEL_SEL_FILE not in api.list_repo_files(window_repo, repo_type="dataset"):
-        return {}
-    path = hf_hub_download(
-        repo_id=window_repo,
-        filename=LABEL_SEL_FILE,
-        repo_type="dataset",
-        token=token,
-        local_dir=tempfile.mkdtemp(prefix="label_sel_"),
-    )
-    with open(path) as handle:
-        return {key: int(value) for key, value in json.load(handle).items()}
 
 
 def obtain_ids(src_repo=SRC_REPO, token=None, roi_dir="hf_roi"):
@@ -424,10 +399,9 @@ def process_data(
     `train_val_label_sel` (default TRAIN_VAL_LABEL_SEL = 0, the union of
     accumulated active fire and NIFC perimeters) and test fires use their ROI
     label_sel (the paper's per-fire choice). `use_roi_label_sel=False` uses
-    `train_val_label_sel` for test fires too. Fires already in `window_repo` are
-    skipped unless `overwrite` is set, except fires whose recorded label_sel
-    differs from the one wanted: those are rebuilt so every archive follows
-    the current rule. The rule per archive is recorded in label_sel.json.
+    `train_val_label_sel` for test fires too. Each archive records its
+    label_sel. Fires already in `window_repo` are skipped unless `overwrite`
+    is set.
     """
     if window_repo is None:
         window_repo = window_repo_for(length, interval)
@@ -456,21 +430,9 @@ def process_data(
         for split_name in splits
         for fire_id in ids_by_split[split_name]
     }
-    manifest = read_label_sel_manifest(processor.api, window_repo, token)
-    existing_files = set(processor.api.list_repo_files(window_repo, repo_type="dataset"))
 
     for split_name in splits:
-        # Processed fires built with a different label rule are rebuilt.
-        stale = []
-        for fire_id in ids_by_split[split_name]:
-            repo_path = f"{split_name}/p{fire_id}.npz"
-            wanted = label_sel_by_id[str(fire_id)]
-            if repo_path in existing_files and manifest.get(repo_path, LEGACY_LABEL_SEL) != wanted:
-                stale.append(str(fire_id))
-        if stale:
-            print(f"{split_name}: rebuilding {len(stale)} processed fires whose label_sel changed: {stale}")
-
-        written = processor.run_split(
+        processor.run_split(
             ids_by_split[split_name],
             split_name,
             length=length,
@@ -478,16 +440,7 @@ def process_data(
             label_sel_by_id=label_sel_by_id,
             overwrite=overwrite,
             debug=debug,
-            reprocess=stale,
         )
-        if written:
-            manifest.update(written)
-            processor.api.upload_file(
-                path_or_fileobj=json.dumps(manifest, indent=2, sort_keys=True).encode(),
-                path_in_repo=LABEL_SEL_FILE,
-                repo_id=window_repo,
-                repo_type="dataset",
-            )
     return processor
 
 

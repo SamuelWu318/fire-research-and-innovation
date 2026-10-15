@@ -56,11 +56,6 @@ WINDOW_CONFIG_FILE = "window_config.json"
 # The released TS-SatFire code used 1 for train/val; set 1 to reproduce it.
 TRAIN_VAL_LABEL_SEL = 0
 
-# Window repo manifest {"<split>/p<id>.npz": label_sel}. Archives missing from
-# it were built before it existed, with LEGACY_LABEL_SEL.
-LABEL_SEL_FILE = "label_sel.json"
-LEGACY_LABEL_SEL = 1
-
 # ----- Train / validation / test split ----- #
 
 TRAIN_VAL_YEARS = ('2017', '2018', '2019', '2020')
