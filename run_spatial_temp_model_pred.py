@@ -38,6 +38,40 @@ PAPER_CE_WEIGHT = (1.0, 446.7836)
 BASE_MODEL_CHANNELS = 43
 
 
+# ----- NEW: optional learning-rate schedule ----- #
+# NOT PART OF THE TS-SATFIRE PAPER OR THE OFFICIAL CODE: both train with a
+# constant learning rate, which stays the default (--lr-schedule none).
+LR_SCHEDULES = ("none", "plateau", "cosine")
+
+
+def build_lr_scheduler(optimizer, schedule, max_epochs, decay_factor, patience, min_lr):
+    """NEW, not in the paper: optional once-per-epoch learning-rate decay.
+
+    none:    constant learning rate, as in the paper and the official code.
+    plateau: multiply the rate by `decay_factor` after `patience` epochs
+             without a lower validation loss, never below `min_lr`.
+    cosine:  decay smoothly from the starting rate to `min_lr` over
+             `max_epochs` epochs.
+    """
+    if schedule == "none":
+        return None
+    if schedule == "plateau":
+        return optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=decay_factor,
+            patience=patience,
+            min_lr=min_lr,
+        )
+    if schedule == "cosine":
+        return optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max_epochs,
+            eta_min=min_lr,
+        )
+    raise ValueError(f"Unsupported learning-rate schedule: {schedule}")
+
+
 def build_wandb_metric_labels(loss_name):
     """Describe the task, loss, and classes included in each graph."""
     loss_title = {
@@ -54,6 +88,8 @@ def build_wandb_metric_labels(loss_name):
         "train_background_f1": "Training F1 — Background",
         "val_fire_f1": "Validation F1 — Next-Day Fire Growth",
         "val_background_f1": "Validation F1 — Background",
+        # Constant unless the NEW (not in the paper) --lr-schedule is used.
+        "learning_rate": "Learning Rate",
     }
     if loss_name == "dicece":
         for prefix, split in (("train", "Training"), ("val", "Validation")):
@@ -403,8 +439,13 @@ def train_model(
     checkpoint_name,
     checkpoint_extra=None,
     artifact_name=None,
+    lr_scheduler=None,
 ):
-    """Train and validate; return the checkpoint with the lowest validation loss."""
+    """Train and validate; return the checkpoint with the lowest validation loss.
+
+    `lr_scheduler` is the NEW optional learning-rate decay (not in the
+    paper); None keeps the paper's constant rate.
+    """
     metric_labels = build_wandb_metric_labels(
         "dicece" if isinstance(criterion, DiceCELoss) else "dice"
     )
@@ -565,6 +606,7 @@ def train_model(
                 metric_labels["mdice"]: mean_dice_val,
                 metric_labels["val_fire_f1"]: val_fire_f1,
                 metric_labels["val_background_f1"]: val_background_f1,
+                metric_labels["learning_rate"]: optimizer.param_groups[0]["lr"],
                 **{metric_labels[name]: value for name, value in val_components.items()},
             }
         )
@@ -573,7 +615,8 @@ def train_model(
             + "".join(f"{k}: {v:.4f}, " for k, v in val_components.items())
             + f"Mean IoU: {mean_iou_val:.4f}, "
             f"Mean Dice: {mean_dice_val:.4f}, "
-            f"Fire F1: {val_fire_f1:.4f}, Background F1: {val_background_f1:.4f}"
+            f"Fire F1: {val_fire_f1:.4f}, Background F1: {val_background_f1:.4f}, "
+            f"LR: {optimizer.param_groups[0]['lr']:.2e}"
         )
 
         checkpoint_path = os.path.join(
@@ -613,6 +656,12 @@ def train_model(
                     checkpoint_extra,
                     artifact_name,
                 )
+
+        # NEW, not in the paper: step the optional learning-rate schedule.
+        if isinstance(lr_scheduler, optim.lr_scheduler.ReduceLROnPlateau):
+            lr_scheduler.step(val_loss)
+        elif lr_scheduler is not None:
+            lr_scheduler.step()
 
     print("Best checkpoints:")
     for negative_loss, checkpoint_path in sorted(
@@ -921,6 +970,35 @@ def parse_args():
     )
     parser.add_argument("--lambda-dice", type=float, default=1.0)
     parser.add_argument("--lambda-ce", type=float, default=1.0)
+    # NEW, not in the TS-SatFire paper or the official code, which both keep
+    # the learning rate constant.
+    parser.add_argument(
+        "--lr-schedule",
+        choices=LR_SCHEDULES,
+        default="none",
+        help="NEW, not in the paper: learning-rate decay. none = constant rate "
+        "(paper and official code); plateau = multiply by --lr-decay-factor "
+        "after --lr-patience epochs without a lower validation loss; cosine = "
+        "smooth decay to --lr-min over --epochs",
+    )
+    parser.add_argument(
+        "--lr-decay-factor",
+        type=float,
+        default=0.5,
+        help="NEW, plateau only: multiply the learning rate by this",
+    )
+    parser.add_argument(
+        "--lr-patience",
+        type=int,
+        default=5,
+        help="NEW, plateau only: epochs without a lower validation loss before decaying",
+    )
+    parser.add_argument(
+        "--lr-min",
+        type=float,
+        default=1e-6,
+        help="NEW, plateau and cosine: the lowest learning rate",
+    )
     parser.add_argument(
         "--upload-checkpoints",
         action="store_true",
@@ -999,8 +1077,19 @@ def main():
             lambda_dice=args.lambda_dice,
             lambda_ce=args.lambda_ce,
         )
+    # NEW, not in the paper: the optional learning-rate schedule, recorded in
+    # W&B and the checkpoint so decayed runs are never mistaken for paper runs.
+    lr_config = {"lr_schedule": args.lr_schedule}
+    if args.lr_schedule != "none":
+        lr_config["lr_min"] = args.lr_min
+    if args.lr_schedule == "plateau":
+        lr_config.update(
+            lr_decay_factor=args.lr_decay_factor,
+            lr_patience=args.lr_patience,
+        )
+    lr_tag = "" if args.lr_schedule == "none" else f"_lr-{args.lr_schedule}"
     # Name tag for checkpoints; the released-code Dice loss keeps the old names.
-    run_tag = tessera_tag + ("" if args.loss == "dice" else f"_{args.loss}")
+    run_tag = tessera_tag + ("" if args.loss == "dice" else f"_{args.loss}") + lr_tag
 
     configure_wandb(
         model_name=model_name,
@@ -1035,6 +1124,9 @@ def main():
     )
     if model_name == "swinunetr3d":
         wandb.config.update({"swin_temporal_downsample": args.swin_temporal_downsample})
+    wandb.config.update(lr_config)
+    if lr_tag:
+        wandb.run.name += lr_tag
     model = nn.DataParallel(model)
     model.to(device)
 
@@ -1138,11 +1230,20 @@ def main():
                 "swin_temporal_downsample": args.swin_temporal_downsample,
                 "tessera_stats": tessera_stats,
                 "loss_config": loss_config,
+                "lr_config": lr_config,
             },
             artifact_name=(
                 f"{model_name}{run_tag.replace('_', '-')}-checkpoints-{wandb.run.id}"
                 if args.upload_checkpoints
                 else None
+            ),
+            lr_scheduler=build_lr_scheduler(
+                optimizer,
+                args.lr_schedule,
+                max_epochs,
+                args.lr_decay_factor,
+                args.lr_patience,
+                args.lr_min,
             ),
         )
         if not args.test_after_train:
