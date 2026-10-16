@@ -1,6 +1,7 @@
 import argparse
 import heapq
 import os
+import random
 from collections import defaultdict
 from pathlib import Path
 
@@ -13,7 +14,6 @@ from monai.data import decollate_batch
 from monai.losses.dice import DiceCELoss, DiceLoss
 from monai.metrics import DiceMetric, MeanIoU
 from monai.transforms import Activations, AsDiscrete, Compose
-from sklearn.metrics import jaccard_score
 from torch import nn, optim
 from torch.cuda.amp import GradScaler
 from torch.utils.data import DataLoader, Subset
@@ -88,6 +88,13 @@ def build_wandb_metric_labels(loss_name):
         "train_background_f1": "Training F1 — Background",
         "val_fire_f1": "Validation F1 — Next-Day Fire Growth",
         "val_background_f1": "Validation F1 — Background",
+        # The paper's IoU (Equation 2) for the fire class; logged, never trained on.
+        "train_fire_iou": "Training IoU — Next-Day Fire Growth",
+        "val_fire_iou": "Validation IoU — Next-Day Fire Growth",
+        # NEW, not in the paper: test fires scored with the current weights
+        # every --test-every epochs (logging only).
+        "periodic_test_f1": "Test F1 — Next-Day Fire Growth (periodic, current weights)",
+        "periodic_test_iou": "Test IoU — Next-Day Fire Growth (periodic, current weights)",
         # Constant unless the NEW (not in the paper) --lr-schedule is used.
         "learning_rate": "Learning Rate",
     }
@@ -420,6 +427,25 @@ def background_f1(predictions, labels):
     return _channel_f1(predictions, labels, channel=0)
 
 
+def fire_only_iou(predictions, labels):
+    """Per-sample next-day fire-growth IoU, the paper's Equation 2.
+
+    IoU = TP / (TP + FP + FN) on thresholded channel 1. Empty prediction and
+    empty target score 1, like the official code's test, which used
+    sklearn's jaccard_score(zero_division=1).
+    Logged only; never part of the training loss.
+    """
+    predicted = predictions[:, 1].bool().flatten(start_dim=1)
+    target = (labels[:, 1] > 0).flatten(start_dim=1)
+    intersection = (predicted & target).sum(dim=1).float()
+    union = (predicted | target).sum(dim=1).float()
+    return torch.where(
+        union > 0,
+        intersection / union.clamp_min(1.0),
+        torch.ones_like(union),
+    )
+
+
 def train_model(
     model,
     model_name,
@@ -440,11 +466,18 @@ def train_model(
     checkpoint_extra=None,
     artifact_name=None,
     lr_scheduler=None,
+    test_every=0,
+    score_test_fires=None,
 ):
     """Train and validate; return the checkpoint with the lowest validation loss.
 
     `lr_scheduler` is the NEW optional learning-rate decay (not in the
     paper); None keeps the paper's constant rate.
+
+    NEW, not in the paper: with `test_every` > 0, `score_test_fires()` scores
+    the test fires with the current weights every `test_every` epochs, for
+    logging only. It runs in eval mode without gradients, so no weight or
+    batch-norm statistic changes, and it never affects checkpoint choice.
     """
     metric_labels = build_wandb_metric_labels(
         "dicece" if isinstance(criterion, DiceCELoss) else "dice"
@@ -458,6 +491,7 @@ def train_model(
         train_components = {}
         train_fire_f1_sum = 0.0
         train_background_f1_sum = 0.0
+        train_fire_iou_sum = 0.0
         train_bar = tqdm(
             train_dataloader,
             total=len(train_dataloader),
@@ -486,6 +520,7 @@ def train_model(
                 )
                 train_fire_f1_sum += fire_only_f1(predictions, labels_batch).sum().item()
                 train_background_f1_sum += background_f1(predictions, labels_batch).sum().item()
+                train_fire_iou_sum += fire_only_iou(predictions, labels_batch).sum().item()
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -518,6 +553,7 @@ def train_model(
                 metric_labels["train_loss"]: train_loss,
                 metric_labels["train_fire_f1"]: train_fire_f1_sum / len(train_dataset),
                 metric_labels["train_background_f1"]: train_background_f1_sum / len(train_dataset),
+                metric_labels["train_fire_iou"]: train_fire_iou_sum / len(train_dataset),
                 **{metric_labels[name]: value for name, value in train_components.items()},
             }
         )
@@ -533,6 +569,7 @@ def train_model(
         dice_values = []
         val_fire_f1_sum = 0.0
         val_background_f1_sum = 0.0
+        val_fire_iou_sum = 0.0
         val_bar = tqdm(
             val_dataloader,
             total=len(val_dataloader),
@@ -569,6 +606,7 @@ def train_model(
                 predictions = torch.stack(discrete_outputs)
                 val_fire_f1_sum += fire_only_f1(predictions, labels_batch).sum().item()
                 val_background_f1_sum += background_f1(predictions, labels_batch).sum().item()
+                val_fire_iou_sum += fire_only_iou(predictions, labels_batch).sum().item()
 
                 iou_values.append(
                     mean_iou(
@@ -597,6 +635,7 @@ def train_model(
         mean_dice_val = float(np.mean(dice_values))
         val_fire_f1 = val_fire_f1_sum / len(val_dataset)
         val_background_f1 = val_background_f1_sum / len(val_dataset)
+        val_fire_iou = val_fire_iou_sum / len(val_dataset)
 
         wandb.log(
             {
@@ -606,6 +645,7 @@ def train_model(
                 metric_labels["mdice"]: mean_dice_val,
                 metric_labels["val_fire_f1"]: val_fire_f1,
                 metric_labels["val_background_f1"]: val_background_f1,
+                metric_labels["val_fire_iou"]: val_fire_iou,
                 metric_labels["learning_rate"]: optimizer.param_groups[0]["lr"],
                 **{metric_labels[name]: value for name, value in val_components.items()},
             }
@@ -615,7 +655,8 @@ def train_model(
             + "".join(f"{k}: {v:.4f}, " for k, v in val_components.items())
             + f"Mean IoU: {mean_iou_val:.4f}, "
             f"Mean Dice: {mean_dice_val:.4f}, "
-            f"Fire F1: {val_fire_f1:.4f}, Background F1: {val_background_f1:.4f}, "
+            f"Fire F1: {val_fire_f1:.4f}, Fire IoU: {val_fire_iou:.4f}, "
+            f"Background F1: {val_background_f1:.4f}, "
             f"LR: {optimizer.param_groups[0]['lr']:.2e}"
         )
 
@@ -662,6 +703,36 @@ def train_model(
             lr_scheduler.step(val_loss)
         elif lr_scheduler is not None:
             lr_scheduler.step()
+
+        # NEW, not in the paper: watch the test scores during training.
+        # Logging only; the test fires never reach the loss or the optimizer.
+        if test_every and score_test_fires is not None and (epoch + 1) % test_every == 0:
+            # Building test loaders draws random numbers; restoring every
+            # random state keeps the training run identical with or without
+            # these checks.
+            rng_states = (
+                random.getstate(),
+                np.random.get_state(),
+                torch.get_rng_state(),
+                torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            )
+            test_scores = score_test_fires()
+            random.setstate(rng_states[0])
+            np.random.set_state(rng_states[1])
+            torch.set_rng_state(rng_states[2])
+            if rng_states[3] is not None:
+                torch.cuda.set_rng_state_all(rng_states[3])
+            wandb.log(
+                {
+                    metric_labels["epoch"]: epoch,
+                    metric_labels["periodic_test_f1"]: test_scores["f1"],
+                    metric_labels["periodic_test_iou"]: test_scores["iou"],
+                }
+            )
+            print(
+                f"Epoch {epoch + 1}, test fires (current weights, logging only): "
+                f"F1 {test_scores['f1']:.4f}, IoU {test_scores['iou']:.4f}"
+            )
 
     print("Best checkpoints:")
     for negative_loss, checkpoint_path in sorted(
@@ -710,8 +781,14 @@ def evaluate_model(
     num_heads,
     hidden_size,
     model_input_channels,
+    save_plots=True,
+    verbose=True,
 ):
-    """Evaluate one fire at a time while sharing one indexed test Dataset."""
+    """Score the test fires one at a time and return the paper's metrics.
+
+    Each fire's score is the mean over its windows; the model's score is the
+    mean over fires. Returns {"f1", "iou", "background_f1", "fires"}.
+    """
     indices_by_fire = defaultdict(list)
     for dataset_idx, (archive_path, _) in enumerate(test_dataset.index):
         fire_id = archive_path.stem
@@ -724,7 +801,8 @@ def evaluate_model(
         raise RuntimeError("No test fires match the available NPZ archives")
 
     plot_dir = Path(plot_dir)
-    plot_dir.mkdir(parents=True, exist_ok=True)
+    if save_plots:
+        plot_dir.mkdir(parents=True, exist_ok=True)
 
     model.eval()
     f1_all = 0.0
@@ -766,20 +844,17 @@ def evaluate_model(
             predictions = torch.stack(discrete_outputs).cpu()
             fire_f1 += fire_only_f1(predictions, labels_batch).sum().item()
             fire_background_f1 += background_f1(predictions, labels_batch).sum().item()
-            outputs_numpy = predictions.numpy()
+            fire_iou += fire_only_iou(predictions, labels_batch).sum().item()
             window_count += data_batch.shape[0]
+            if not save_plots:
+                continue
 
+            outputs_numpy = predictions.numpy()
             for sample_idx in range(data_batch.shape[0]):
                 prediction = outputs_numpy[sample_idx, 1]
                 label = (
                     labels_batch[sample_idx, 1] > 0
                 ).cpu().numpy()
-
-                fire_iou += jaccard_score(
-                    label.flatten(),
-                    prediction.flatten(),
-                    zero_division=1.0,
-                )
 
                 background = data_batch[
                     sample_idx,
@@ -847,9 +922,10 @@ def evaluate_model(
         iou_all += mean_fire_iou
         evaluated_fire_count += 1
 
-        print(f"ID {fire_id} IoU: {mean_fire_iou}")
-        print(f"ID {fire_id} F1: {mean_fire_f1}")
-        print(f"ID {fire_id} Background F1: {fire_background_f1 / window_count}")
+        if verbose:
+            print(f"ID {fire_id} IoU: {mean_fire_iou}")
+            print(f"ID {fire_id} F1: {mean_fire_f1}")
+            print(f"ID {fire_id} Background F1: {fire_background_f1 / window_count}")
 
     if evaluated_fire_count == 0:
         raise RuntimeError("No test fires were evaluated")
@@ -857,17 +933,28 @@ def evaluate_model(
     model_f1 = f1_all / evaluated_fire_count
     model_iou = iou_all / evaluated_fire_count
     model_background_f1 = background_f1_all / evaluated_fire_count
-    print(
-        f"Model F1: {model_f1}; background F1: {model_background_f1}; "
-        f"model IoU: {model_iou}"
-    )
+    if verbose:
+        print(
+            f"Model F1: {model_f1}; background F1: {model_background_f1}; "
+            f"model IoU: {model_iou}"
+        )
+    return {
+        "f1": model_f1,
+        "iou": model_iou,
+        "background_f1": model_background_f1,
+        "fires": evaluated_fire_count,
+    }
+
+
+def log_final_test(scores):
+    """Log the test scores of the best-validation checkpoint (the paper's metrics)."""
     test_metrics = {
-        "test_f1": model_f1,
-        "test_iou": model_iou,
-        "Test F1 — Next-Day Fire Growth": model_f1,
-        "Test IoU — Next-Day Fire Growth": model_iou,
-        "Test F1 — Background": model_background_f1,
-        "test_fires": evaluated_fire_count,
+        "test_f1": scores["f1"],
+        "test_iou": scores["iou"],
+        "Test F1 — Next-Day Fire Growth": scores["f1"],
+        "Test IoU — Next-Day Fire Growth": scores["iou"],
+        "Test F1 — Background": scores["background_f1"],
+        "test_fires": scores["fires"],
     }
     wandb.log(test_metrics)
     # One value per run: the summary shows it in the run overview and table.
@@ -929,6 +1016,14 @@ def parse_args():
         default=str(Path(__file__).resolve().parent / "roi" / "us_fire_2021_out_new.csv"),
     )
     parser.add_argument("--plot-dir", default="evaluation_plot")
+    parser.add_argument(
+        "--test-every",
+        type=int,
+        default=0,
+        help="NEW, not in the paper: also score the test fires with the current "
+        "weights every N epochs (0 = never). Logging only: no gradients, eval "
+        "mode, and checkpoint choice still uses validation loss",
+    )
     parser.add_argument(
         "--test-after-train",
         action=argparse.BooleanOptionalAction,
@@ -1125,6 +1220,8 @@ def main():
     if model_name == "swinunetr3d":
         wandb.config.update({"swin_temporal_downsample": args.swin_temporal_downsample})
     wandb.config.update(lr_config)
+    # NEW, not in the paper: periodic test scoring during training (logging only).
+    wandb.config.update({"test_every": args.test_every})
     if lr_tag:
         wandb.run.name += lr_tag
     model = nn.DataParallel(model)
@@ -1201,6 +1298,42 @@ def main():
             pin_memory=pin_memory,
         )
 
+        # NEW, not in the paper: optional test scoring every --test-every
+        # epochs with the current weights, for logging only.
+        score_test_fires = None
+        if args.test_every > 0:
+            if any(test_npz_dir.glob("*.npz")):
+                periodic_test_dataset = FireDataset(
+                    npz_dir=test_npz_dir,
+                    ts_length=ts_length,
+                    n_channel=stored_n_channels,
+                    target_is_single_day=True,
+                    use_augmentations=False,
+                    tessera_dir=tessera_dir,
+                    tessera_stats=tessera_stats,
+                )
+
+                def score_test_fires():
+                    return evaluate_model(
+                        model=model,
+                        model_name=model_name,
+                        test_dataset=periodic_test_dataset,
+                        batch_size=batch_size,
+                        num_workers=args.num_workers,
+                        pin_memory=pin_memory,
+                        post_trans=post_trans,
+                        device=device,
+                        test_csv_path=args.test_csv,
+                        plot_dir=args.plot_dir,
+                        num_heads=num_heads,
+                        hidden_size=hidden_size,
+                        model_input_channels=model_input_channels,
+                        save_plots=False,
+                        verbose=False,
+                    )
+            else:
+                print(f"No test archives in {test_npz_dir}; --test-every is ignored")
+
         checkpoint_name = (
             f"model_{model_name}_mode_{mode}_num_heads_{num_heads}_"
             f"hidden_size_{hidden_size}_batchsize_{batch_size}_"
@@ -1245,6 +1378,8 @@ def main():
                 args.lr_patience,
                 args.lr_min,
             ),
+            test_every=args.test_every,
+            score_test_fires=score_test_fires,
         )
         if not args.test_after_train:
             return
@@ -1312,7 +1447,7 @@ def main():
         f"loss={checkpoint['loss']}"
     )
 
-    evaluate_model(
+    final_scores = evaluate_model(
         model=model,
         model_name=model_name,
         test_dataset=test_dataset,
@@ -1327,6 +1462,7 @@ def main():
         hidden_size=hidden_size,
         model_input_channels=model_input_channels,
     )
+    log_final_test(final_scores)
 
 
 if __name__ == "__main__":
