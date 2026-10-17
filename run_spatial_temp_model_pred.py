@@ -23,6 +23,9 @@ from satimg_dataset_processor.data_generator_pred_torch import (
     TESSERA_CHANNELS,
     FireDataset,
     compute_tessera_stats,
+    find_fire_sources,
+    fire_name,
+    unzip_data_root,
 )
 from spatial_models.attentionunet import AttentionUnet
 from spatial_models.swinunetr.swinunetr import SwinUNETR
@@ -791,7 +794,7 @@ def evaluate_model(
     """
     indices_by_fire = defaultdict(list)
     for dataset_idx, (archive_path, _) in enumerate(test_dataset.index):
-        fire_id = archive_path.stem
+        fire_id = fire_name(archive_path)
         if fire_id.startswith("p"):
             fire_id = fire_id[1:]
         indices_by_fire[fire_id].append(dataset_idx)
@@ -1001,6 +1004,14 @@ def parse_args():
         help="Directory containing train/, val/, and test/ NPZ folders",
     )
     parser.add_argument(
+        "--unzip-dir",
+        default="auto",
+        help="Where the window archives are unzipped once, so each window is "
+        "read without decompressing (same arrays). 'auto': <data-root>-npy "
+        "beside the data root; 'off': read the archives. Skipped when the "
+        "data root is already unzipped or the disk lacks space.",
+    )
+    parser.add_argument(
         "--unetr-version",
         choices=("v0", "v1"),
         default="v1",
@@ -1154,9 +1165,6 @@ def main():
         if args.data_root is not None
         else root_dir
     )
-    train_npz_dir = processed_data_root / "train"
-    val_npz_dir = processed_data_root / "val"
-    test_npz_dir = processed_data_root / "test"
     tessera_dir = None
     if use_tessera:
         tessera_dir = (
@@ -1164,6 +1172,22 @@ def main():
             if args.tessera_dir is not None
             else processed_data_root / "tessera"
         )
+    # Unzipping copies only the window archives; TESSERA stays where it is.
+    if args.unzip_dir != "off":
+        resolved_root = processed_data_root.resolve()
+        unzip_root = (
+            resolved_root.with_name(resolved_root.name + "-npy")
+            if args.unzip_dir == "auto"
+            else Path(args.unzip_dir).expanduser()
+        )
+        processed_data_root = unzip_data_root(
+            processed_data_root,
+            unzip_root,
+            splits=("test",) if args.run_test else ("train", "val", "test"),
+        )
+    train_npz_dir = processed_data_root / "train"
+    val_npz_dir = processed_data_root / "val"
+    test_npz_dir = processed_data_root / "test"
     tessera_tag = "_tessera" if use_tessera else ""
     loss_config = {"loss": args.loss}
     if args.loss == "dicece":
@@ -1254,7 +1278,10 @@ def main():
         if use_tessera:
             # Normalization comes from the training fires only.
             tessera_stats = compute_tessera_stats(
-                [tessera_dir / path.name for path in sorted(train_npz_dir.glob("*.npz"))],
+                [
+                    tessera_dir / f"{fire_name(path)}.npz"
+                    for path in find_fire_sources(train_npz_dir)
+                ],
                 min_coverage=args.tessera_min_coverage,
             )
         train_dataset = FireDataset(
@@ -1302,7 +1329,7 @@ def main():
         # epochs with the current weights, for logging only.
         score_test_fires = None
         if args.test_every > 0:
-            if any(test_npz_dir.glob("*.npz")):
+            if find_fire_sources(test_npz_dir):
                 periodic_test_dataset = FireDataset(
                     npz_dir=test_npz_dir,
                     ts_length=ts_length,
@@ -1383,7 +1410,7 @@ def main():
         )
         if not args.test_after_train:
             return
-        if not any(test_npz_dir.glob("*.npz")):
+        if not find_fire_sources(test_npz_dir):
             print(f"No test archives in {test_npz_dir}; skipping the test step")
             return
         # The paper's metrics on the test fires, from the best-validation checkpoint.

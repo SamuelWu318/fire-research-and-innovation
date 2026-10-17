@@ -5,6 +5,12 @@ Comment legend requested for this migration:
     # - OLD: behavior retained from the original FireDataset implementation.
 """
 
+import json
+import os
+import shutil
+import zipfile
+from concurrent.futures import ThreadPoolExecutor
+from functools import cached_property
 # * NEW: Path must be imported from pathlib; `import Path` is not valid here.
 from pathlib import Path
 
@@ -55,9 +61,215 @@ class Normalize:
         return sample
 
 
+# * NEW: a fire's windows are stored either as one p<id>.npz archive or as a
+# * NEW: p<id>/ folder holding that archive's members unzipped (data_000.npy,
+# * NEW: label_000.npy, ...). The arrays are byte-identical; reading a folder
+# * NEW: skips zlib, which took about half of each window's loading time.
+UNZIP_MARKER = ".source.json"
+
+
+def fire_name(source):
+    """Return p<id> for either a p<id>.npz archive or a p<id>/ folder."""
+    source = Path(source)
+    return source.stem if source.suffix == ".npz" else source.name
+
+
+def find_fire_sources(split_dir):
+    """List a split's fires, each as its archive or its unzipped folder.
+
+    A folder counts once it holds num_windows.npy and is used instead of an
+    archive of the same name. Hidden names (unzip work folders) are skipped.
+    """
+    split_dir = Path(split_dir)
+    if not split_dir.is_dir():
+        return []
+    sources = {}
+    for path in split_dir.iterdir():
+        if path.name.startswith("."):
+            continue
+        if path.suffix == ".npz" and path.is_file():
+            sources.setdefault(path.stem, path)
+        elif path.is_dir() and (path / "num_windows.npy").is_file():
+            sources[path.name] = path
+    # Same order as sorting the archive names, so window indexes match runs
+    # made before unzipped folders existed.
+    return [sources[name] for name in sorted(sources, key=lambda n: f"{n}.npz")]
+
+
+class _FireFolder:
+    """Read an unzipped p<id>/ folder through np.load's NpzFile interface."""
+
+    def __init__(self, folder):
+        self.folder = Path(folder)
+
+    @cached_property
+    def files(self):
+        return [path.stem for path in self.folder.glob("*.npy")]
+
+    def __getitem__(self, key):
+        return np.load(self.folder / f"{key}.npy", allow_pickle=False)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+def open_fire(source):
+    """Open a fire archive or unzipped folder for `with ... as archive`."""
+    if Path(source).is_dir():
+        return _FireFolder(source)
+    return np.load(source, allow_pickle=False)
+
+
+def _archive_signature(archive_path):
+    archive_path = Path(archive_path).resolve()
+    stat = archive_path.stat()
+    return {
+        "archive": str(archive_path),
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+    }
+
+
+def _read_unzip_marker(folder):
+    try:
+        return json.loads((folder / UNZIP_MARKER).read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def _unzip_fire(archive_path, folder):
+    """Unzip one archive into a hidden work folder, then rename it to folder."""
+    work = folder.with_name(f".{folder.name}.partial")
+    if work.exists():
+        shutil.rmtree(work)
+    work.mkdir(parents=True)
+    with zipfile.ZipFile(archive_path) as archive:
+        for member in archive.infolist():
+            name = member.filename
+            if (
+                not name.endswith(".npy")
+                or name.startswith(".")
+                or "/" in name
+                or "\\" in name
+            ):
+                raise ValueError(f"{archive_path}: unexpected member {name!r}")
+            # ZipFile checks each member's CRC as it is read.
+            with archive.open(member) as src, open(work / name, "wb") as dst:
+                shutil.copyfileobj(src, dst, 1 << 20)
+    (work / UNZIP_MARKER).write_text(json.dumps(_archive_signature(archive_path)))
+    if folder.exists():
+        shutil.rmtree(folder)
+    work.rename(folder)
+
+
+def unzip_data_root(
+    data_root,
+    unzip_root,
+    splits=("train", "val", "test"),
+    workers=None,
+):
+    """Unzip each split's archives once into unzip_root; return the root to load.
+
+    Returns unzip_root once every data_root/<split>/p<id>.npz has a matching
+    unzip_root/<split>/p<id>/ folder. Folders already unzipped from the same
+    archive (same path, size and modification time) are reused, so this is
+    cheap after the first call. Returns data_root unchanged, and FireDataset
+    reads the archives directly, when data_root holds no archives (it is
+    already unzipped) or when unzip_root is not writable or lacks the space.
+    """
+    data_root, unzip_root = Path(data_root), Path(unzip_root)
+    sources = {split: find_fire_sources(data_root / split) for split in splits}
+    if not any(sources.values()):
+        return data_root
+    if any(path.suffix != ".npz" for paths in sources.values() for path in paths):
+        print(f"{data_root} already holds unzipped fire folders; using it as is")
+        return data_root
+
+    jobs = []
+    stale = []
+    for split, archives in sources.items():
+        split_dir = unzip_root / split
+        for archive in archives:
+            folder = split_dir / archive.stem
+            if _read_unzip_marker(folder) != _archive_signature(archive):
+                jobs.append((archive, folder))
+        # Folders this function made for fires that data_root no longer has.
+        names = {archive.stem for archive in archives}
+        if split_dir.is_dir():
+            stale += [
+                folder
+                for folder in split_dir.iterdir()
+                if folder.name not in names and (folder / UNZIP_MARKER).is_file()
+            ]
+
+    for folder in stale:
+        shutil.rmtree(folder)
+    if not jobs:
+        print(f"Using unzipped windows in {unzip_root}")
+        return unzip_root
+
+    needed = 0
+    for archive, _ in jobs:
+        with zipfile.ZipFile(archive) as zipped:
+            needed += sum(member.file_size for member in zipped.infolist())
+    try:
+        unzip_root.mkdir(parents=True, exist_ok=True)
+        free = shutil.disk_usage(unzip_root).free
+    except OSError as error:
+        print(f"Cannot write {unzip_root} ({error}); reading the archives directly")
+        return data_root
+    if needed + (1 << 30) > free:
+        print(
+            f"Unzipping needs {needed / 2**30:.1f} GiB but {unzip_root} has "
+            f"{free / 2**30:.1f} GiB free; reading the archives directly"
+        )
+        return data_root
+
+    print(
+        f"Unzipping {len(jobs)} fire archives ({needed / 2**30:.1f} GiB) "
+        f"into {unzip_root}"
+    )
+    try:
+        # zlib and file writes release the GIL, so threads unzip in parallel.
+        with ThreadPoolExecutor(max_workers=workers or os.cpu_count()) as pool:
+            for _ in pool.map(lambda job: _unzip_fire(*job), jobs):
+                pass
+    except OSError as error:
+        print(f"Unzipping failed ({error}); reading the archives directly")
+        return data_root
+    return unzip_root
+
+
 # * NEW: TESSERA files hold 128 embedding bands; one validity mask is added.
 TESSERA_BANDS = 128
 TESSERA_CHANNELS = TESSERA_BANDS + 1
+
+# * NEW: stored (embedding, coverage) arrays by resolved TESSERA path, so each
+# * NEW: file is unzipped once per process (about 16 MiB per fire as float16)
+# * NEW: and shared by compute_tessera_stats and every FireDataset.
+_TESSERA_CACHE = {}
+
+
+def read_tessera(path):
+    """Return one TESSERA file's stored (embedding, coverage), read once."""
+    path = Path(path).resolve()
+    if path not in _TESSERA_CACHE:
+        with np.load(path, allow_pickle=False) as archive:
+            embedding = archive["embedding"]
+            coverage = archive["coverage"]
+        if embedding.shape != (TESSERA_BANDS, 256, 256):
+            raise ValueError(
+                f"{path}: embedding has shape {embedding.shape}; "
+                f"expected ({TESSERA_BANDS}, 256, 256)"
+            )
+        # Shared by every dataset and DataLoader worker: never modify them.
+        embedding.flags.writeable = False
+        coverage.flags.writeable = False
+        _TESSERA_CACHE[path] = (embedding, coverage)
+    return _TESSERA_CACHE[path]
 
 
 def compute_tessera_stats(tessera_paths, min_coverage=0.5):
@@ -70,9 +282,9 @@ def compute_tessera_stats(tessera_paths, min_coverage=0.5):
     total_sq = np.zeros(TESSERA_BANDS, dtype=np.float64)
     count = 0
     for path in tessera_paths:
-        with np.load(path, allow_pickle=False) as archive:
-            embedding = archive["embedding"].astype(np.float64)
-            valid = archive["coverage"].astype(np.float32) >= min_coverage
+        embedding, coverage = read_tessera(path)
+        embedding = embedding.astype(np.float64)
+        valid = coverage.astype(np.float32) >= min_coverage
         values = embedding[:, valid]
         total += values.sum(axis=1)
         total_sq += (values ** 2).sum(axis=1)
@@ -104,6 +316,9 @@ class FireDataset(Dataset):
     Because each window is a separate ZIP member, __getitem__ decompresses
     only the requested data/label pair rather than the entire fire.
 
+    A fire may instead be a p<id>/ folder of the same members as plain .npy
+    files (see unzip_data_root); the format is detected per fire.
+
     Each item is {"data": (43, T, H, W), "labels": (2, H, W)}, plus
     "static": (129, H, W) in TESSERA mode. The trainer repeats "static" across
     the T days on the GPU and appends it after the 43 channels.
@@ -120,30 +335,44 @@ class FireDataset(Dataset):
         tessera_dir=None,
         tessera_stats=None,
     ):
-        # * NEW: data and labels now live together in version-2 NPZ files.
+        # * NEW: data and labels now live together in version-2 NPZ files,
+        # * NEW: or in unzipped p<id>/ folders of the same members.
         self.npz_dir = Path(npz_dir)
-        self.npz_files = sorted(self.npz_dir.glob("*.npz"))
+        self.npz_files = find_fire_sources(self.npz_dir)
 
         if not self.npz_files:
-            raise RuntimeError(f"No .npz files found in {self.npz_dir}")
+            raise RuntimeError(
+                f"No .npz archives or unzipped fire folders found in {self.npz_dir}"
+            )
 
         # * NEW: optional TESSERA mode. Each fire archive p<id>.npz pairs with
         # * NEW: <tessera_dir>/p<id>.npz; None keeps the 27-channel behavior.
         self.tessera_dir = Path(tessera_dir) if tessera_dir is not None else None
         self.tessera_stats = tessera_stats
+        # * NEW: each fire's TESSERA map is read here, once, rather than in
+        # * NEW: every __getitem__. DataLoader workers forked later (Linux,
+        # * NEW: including Kaggle) share these arrays instead of copying them.
+        self.tessera_maps = {}
         if self.tessera_dir is not None:
             if tessera_stats is None:
                 raise ValueError("tessera_stats is required with tessera_dir")
             missing = [
-                path.name
+                f"{fire_name(path)}.npz"
                 for path in self.npz_files
-                if not (self.tessera_dir / path.name).exists()
+                if not (self.tessera_dir / f"{fire_name(path)}.npz").exists()
             ]
             if missing:
                 raise RuntimeError(
                     f"{len(missing)} archives in {self.npz_dir} have no TESSERA "
                     f"file in {self.tessera_dir}: {missing[:10]}"
                 )
+            for path in self.npz_files:
+                name = fire_name(path)
+                embedding, coverage = read_tessera(self.tessera_dir / f"{name}.npz")
+                valid = (
+                    coverage.astype(np.float32) >= tessera_stats["min_coverage"]
+                )
+                self.tessera_maps[name] = (embedding, valid)
 
         # - OLD: retain these options so existing training configuration and
         # - OLD: FireDataset calls continue to express the same behavior.
@@ -161,7 +390,7 @@ class FireDataset(Dataset):
         # * NEW: each entry is `(archive_path, window_index_inside_archive)`.
         self.index = []
         for npz_path in self.npz_files:
-            with np.load(npz_path, allow_pickle=False) as archive:
+            with open_fire(npz_path) as archive:
                 # * NEW: reject old archives rather than silently loading the
                 # * NEW: whole `data` member and defeating lazy decompression.
                 if "num_windows" not in archive.files:
@@ -328,8 +557,9 @@ class FireDataset(Dataset):
         label_key = f"label_{suffix}"
 
         # * NEW: only one approximately 67.5-MiB input window is decompressed,
-        # * NEW: rather than every window stored for this fire.
-        with np.load(npz_path, allow_pickle=False) as archive:
+        # * NEW: rather than every window stored for this fire. An unzipped
+        # * NEW: folder reads the same two members without decompressing.
+        with open_fire(npz_path) as archive:
             data_array = archive[data_key]
             label_array = archive[label_key]
 
@@ -409,20 +639,13 @@ class FireDataset(Dataset):
         zeroed (the normalized mean) and marked 0 in the mask channel.
         """
         npz_path, _ = self.index[idx]
-        tessera_path = self.tessera_dir / npz_path.name
-        with np.load(tessera_path, allow_pickle=False) as archive:
-            embedding = archive["embedding"].astype(np.float32)
-            coverage = archive["coverage"].astype(np.float32)
-
-        if embedding.shape != (TESSERA_BANDS, 256, 256):
-            raise ValueError(
-                f"{tessera_path}: embedding has shape {embedding.shape}; "
-                f"expected ({TESSERA_BANDS}, 256, 256)"
-            )
+        # * NEW: the stored map was read in __init__; only normalization,
+        # * NEW: unchanged, runs per window.
+        embedding, valid = self.tessera_maps[fire_name(npz_path)]
+        embedding = embedding.astype(np.float32)
 
         mean = self.tessera_stats["mean"][:, None, None]
         std = self.tessera_stats["std"][:, None, None]
-        valid = coverage >= self.tessera_stats["min_coverage"]
         embedding = np.where(valid, (embedding - mean) / std, 0.0)
 
         static = np.concatenate(
